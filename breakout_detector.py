@@ -1,4 +1,4 @@
-# breakout_detector.py
+# modules/breakout_detector.py
 
 import pandas as pd
 from .entry_score    import evaluate_entry
@@ -49,3 +49,4 @@ def detect_breakouts(df_indicators, df_macro, static_adj=0.0, std_mult=0.5):
                 })
 
     return pd.DataFrame(breakouts)
+
