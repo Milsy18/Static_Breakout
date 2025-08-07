@@ -1,0 +1,24 @@
+# data artifacts (keep placeholders)
+Data/**/*.csv
+Data/**/*.parquet
+Data/**/*.feather
+!Data/**/.gitkeep
+
+# notebooks + caches
+.ipynb_checkpoints/
+*.ipynb.zip
+
+# python junk
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+
+# envs
+.env
+venv/
+.venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
