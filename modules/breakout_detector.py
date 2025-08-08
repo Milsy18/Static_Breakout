@@ -2,6 +2,7 @@
 
 import warnings
 from pandas.errors import SettingWithCopyWarning
+
 warnings.simplefilter("ignore", SettingWithCopyWarning)
 
 import pandas as pd
@@ -9,7 +10,7 @@ import pandas as pd
 from .entry_score import evaluate_entry
 from .market_level import compute_market_level
 
-# optional nice progress bar
+# optional progress bar
 try:
     from tqdm import tqdm
 except Exception:  # pragma: no cover
@@ -27,27 +28,25 @@ def detect_breakouts(
     """
     Detect breakout entries per symbol.
 
-    Expects df_indicators to contain at least: ['date','symbol','close', ...indicators]
-    df_macro is passed to compute_market_level() to derive the market regime.
-
-    Parameters
-    ----------
-    static_adj : float
-        Constant adjustment added to the dynamic threshold (bias).
-    std_mult : float
-        Multiplier for the trailing standard deviation part of the threshold.
-    lookback : int
-        Window size used when computing the trailing mean/std of score_norm.
-
-    Returns
-    -------
-    pd.DataFrame with one row per detected entry containing:
-      ['symbol','entry_date','entry_price','market_level', 'score_*'...]
+    Expects df_indicators with at least: ['date','symbol','close', ...].
+    df_macro is used by compute_market_level() to derive the market regime.
     """
     # 1) compute market level from macro, then join to indicators
-    df_market = compute_market_level(df_macro)
+    df_market = compute_market_level(df_macro).copy()
+
+    # --- normalize dates on BOTH sides before merging ---
+    df_market["date"] = pd.to_datetime(df_market["date"], errors="coerce").dt.normalize()
+
     df = df_indicators.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+
     df = df.merge(df_market, on="date", how="left")
+
+    # quick sanity: how many rows actually received a market_level?
+    match_rate = float(df["market_level"].notna().mean()) if len(df) else 0.0
+    if match_rate < 0.5:
+        # not raising — just a breadcrumb in logs so you notice
+        print(f"[breakout_detector] warning: only {match_rate:.1%} of rows matched a market_level on date join")
 
     breakouts = []
 
@@ -77,19 +76,15 @@ def detect_breakouts(
                 std_score = 0.0
                 prev_score_norm = 0.0
 
-            # build a safe dict (no chained assignment) to feed into evaluate_entry
             row_dict = row.to_dict()
             row_dict["score_norm_prev"] = prev_score_norm
 
-            # evaluate this bar
             result = evaluate_entry(
                 row_dict, market_level, mean_score, std_score, static_adj, std_mult
             )
 
-            # keep trail for next iteration
             score_trail.append(float(result.get("score_norm", 0.0)))
 
-            # record breakout
             if result.get("entry_signal"):
                 out = {
                     "symbol": row_dict.get("symbol"),
@@ -97,9 +92,7 @@ def detect_breakouts(
                     "entry_price": row_dict.get("close"),
                     "market_level": market_level,
                 }
-                # include all score_* fields from the result
                 out.update({k: v for k, v in result.items() if k.startswith("score_")})
                 breakouts.append(out)
 
     return pd.DataFrame(breakouts)
-
