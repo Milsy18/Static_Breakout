@@ -1,119 +1,111 @@
-# build_macro_regime_data.py
-# Create Data/Raw/macro_regime_data.csv from btc_d/usdt_d/total/total3 raw files.
+# modules/breakout_detector.py
 
-import re
-import sys
-import glob
-from pathlib import Path
+from __future__ import annotations
+import warnings
+from pandas.errors import SettingWithCopyWarning
+
+warnings.simplefilter("ignore", SettingWithCopyWarning)
+
 import pandas as pd
 
-RAW_DIR = Path("Data/Raw")
-OUT_CSV = RAW_DIR / "macro_regime_data.csv"
+from .entry_score import evaluate_entry
+from .market_level import compute_market_level
 
-# ---- utilities --------------------------------------------------------------
+# optional progress bar
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    def tqdm(x, **kwargs):
+        return x
 
-def to_day(s):
+__all__ = ["detect_breakouts"]
+
+
+def _to_day(s: pd.Series) -> pd.Series:
+    """Normalize any datetime-like to naive midnight (calendar day)."""
     s = pd.to_datetime(s, errors="coerce")
-    return pd.to_datetime(s.dt.date)  # drop time/tz -> naive midnight
+    return pd.to_datetime(s.dt.date)
 
-def find_one(patterns):
-    for pat in patterns:
-        hits = sorted(glob.glob(str(RAW_DIR / pat)))
-        if hits:
-            return Path(hits[0])
-    return None
 
-def coerce_numeric(series: pd.Series) -> pd.Series:
-    # strip %, commas, spaces; then to_numeric
-    return pd.to_numeric(series.astype(str).str.replace(r"[%,\s]", "", regex=True), errors="coerce")
+def detect_breakouts(
+    df_indicators: pd.DataFrame,
+    df_macro: pd.DataFrame,
+    static_adj: float = 0.0,
+    std_mult: float = 0.5,
+    lookback: int = 100,
+) -> pd.DataFrame:
+    """
+    Detect breakout entries per symbol.
 
-def pick_value_column(df: pd.DataFrame):
-    # try common names in order, otherwise last numeric
-    candidates = ["close","value","dominance","dom","price","adj_close","total","marketcap","cap"]
-    cols = [c.lower().strip().replace(".","_") for c in df.columns]
-    rename = dict(zip(df.columns, cols))
-    df = df.rename(columns=rename)
+    Expects df_indicators with at least: ['date','symbol','close', ...].
+    df_macro is used by compute_market_level() to derive the market regime.
+    """
+    # 1) compute market level from macro, then join to indicators
+    df_market = compute_market_level(df_macro).copy()
+    df_market["date"] = _to_day(df_market["date"])
 
-    for c in candidates:
-        if c in df.columns:
-            return df, c
-    # otherwise choose last numeric column
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(pd.to_numeric(df[c], errors="ignore"))]
-    if not numeric_cols:
-        # try converting everything to numeric and re-evaluate
-        tmp = df.apply(lambda s: pd.to_numeric(s, errors="coerce"))
-        numeric_cols = [c for c in tmp.columns if tmp[c].notna().any()]
-    if not numeric_cols:
-        raise ValueError("Could not find a numeric value column in file.")
-    return df, numeric_cols[-1]
+    df = df_indicators.copy()
+    df["date"] = _to_day(df["date"])
 
-def load_series(label: str, file_patterns, date_candidates=("date","time","timestamp")) -> pd.DataFrame:
-    p = find_one(file_patterns)
-    if not p:
-        raise FileNotFoundError(f"{label}: could not locate any of {file_patterns} under {RAW_DIR}")
-    df = pd.read_csv(p)
-    # normalize headers
-    df.columns = [str(c).lower().strip().replace(".","_") for c in df.columns]
+    df = df.merge(df_market, on="date", how="left")
 
-    # date col
-    date_col = next((c for c in date_candidates if c in df.columns), None)
-    if date_col is None:
-        raise KeyError(f"{label}: no date column found among {date_candidates} in {p.name}")
-    df["date"] = to_day(df[date_col])
+    # quick sanity: how many rows actually received a market_level?
+    if len(df):
+        match_rate = float(df["market_level"].notna().mean())
+        if match_rate < 0.5:
+            print(f"[breakout_detector] warning: only {match_rate:.1%} of rows matched a market_level on date join")
 
-    # drop rows without date
-    df = df.dropna(subset=["date"]).sort_values("date")
+    breakouts = []
 
-    # value col
-    df, val_col = pick_value_column(df)
-    df[label] = coerce_numeric(df[val_col])
-
-    # minimal frame
-    out = df[["date", label]].copy()
-
-    # resample to daily, take last available value that day
-    out = (out.groupby("date", as_index=False)[label].last()
+    # 2) process symbol by symbol
+    symbols = df["symbol"].dropna().unique()
+    for symbol in tqdm(sorted(symbols), desc="Detecting breakouts"):
+        df_sym = (
+            df.loc[df["symbol"] == symbol]
               .sort_values("date")
-              .reset_index(drop=True))
-    return out
+              .reset_index(drop=True)
+              .copy()
+        )
 
-# ---- main build -------------------------------------------------------------
+        # trail of computed score_norm (from evaluate_entry results)
+        score_trail: list[float] = []
 
-def main():
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
+        for i in range(len(df_sym)):
+            row = df_sym.iloc[i]
 
-    btc   = load_series("btc_d",   ["btc_d.csv",   "*btc*d*.csv"])
-    usdt  = load_series("usdt_d",  ["usdt_d.csv",  "*usdt*d*.csv"])
-    total = load_series("total_cap", ["total.csv", "*total*cap*.csv", "total_cap.csv"])
-    total3= load_series("total3",  ["total3.csv",  "*total3*.csv", "total_ex_btc_eth.csv"])
+            # regime level (fallback to neutral 5 if missing)
+            ml = row.get("market_level")
+            market_level = int(ml) if pd.notna(ml) else 5
 
-    # merge all on calendar day
-    df = btc.merge(usdt,  on="date", how="outer")
-    df = df.merge(total,  on="date", how="outer")
-    df = df.merge(total3, on="date", how="outer")
-    df = df.sort_values("date").reset_index(drop=True)
+            # trailing stats for dynamic threshold
+            if score_trail:
+                recent = pd.Series(score_trail[-lookback:])
+                mean_score = float(recent.mean())
+                std_score = float(recent.std())
+                prev_score_norm = float(score_trail[-1])
+            else:
+                mean_score = 0.0
+                std_score = 0.0
+                prev_score_norm = 0.0
 
-    # forward/back fill small gaps
-    for c in ["btc_d","usdt_d","total_cap","total3"]:
-        df[c] = coerce_numeric(df[c])
-    df[["btc_d","usdt_d","total_cap","total3"]] = df[["btc_d","usdt_d","total_cap","total3"]].ffill().bfill()
+            row_dict = row.to_dict()
+            row_dict["score_norm_prev"] = prev_score_norm
 
-    # guard: drop any precomputed market_level if present
-    if "market_level" in df.columns:
-        df = df.drop(columns=["market_level"])
+            result = evaluate_entry(
+                row_dict, market_level, mean_score, std_score, static_adj, std_mult
+            )
 
-    # save
-    df.to_csv(OUT_CSV, index=False)
+            score_trail.append(float(result.get("score_norm", 0.0)))
 
-    # quick report
-    print(f"✅ wrote {OUT_CSV}")
-    print("rows:", len(df), "| date range:", df['date'].min().date(), "→", df['date'].max().date())
-    print(df.head().to_string(index=False))
+            if result.get("entry_signal"):
+                out = {
+                    "symbol": row_dict.get("symbol"),
+                    "entry_date": row_dict.get("date"),
+                    "entry_price": row_dict.get("close"),
+                    "market_level": market_level,
+                }
+                out.update({k: v for k, v in result.items() if k.startswith("score_")})
+                breakouts.append(out)
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("❌ build failed:", e)
-        sys.exit(1)
+    return pd.DataFrame(breakouts)
 
