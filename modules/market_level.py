@@ -34,7 +34,6 @@ def _alias_columns(df: pd.DataFrame, candidates, target: str):
             if c != target:
                 df.rename(columns={c: target}, inplace=True)
             return
-    # if nothing matched, caller will raise with a clear message later
 
 
 # ---------- main API ----------
@@ -43,15 +42,17 @@ def compute_market_level(df_macro: pd.DataFrame) -> pd.DataFrame:
     """
     Compute a 1..9 'market_level' per date from macro inputs.
 
-    Accepts flexible input headers (case/period-insensitive) and also supports a
-    fast-path if a 'market_level' column already exists.
+    Accepts flexible input headers (case/period-insensitive) and supports a
+    safe fast-path: we will only reuse a precomputed 'market_level' column
+    if the required raw inputs are NOT present. If raw inputs exist, we
+    recompute the regime score.
 
-    Expected *logical* fields:
+    Logical fields expected (any common aliases accepted):
       - date (or time)
-      - btc_d    : BTC dominance (%)
-      - usdt_d   : USDT dominance (%)
-      - total_cap: total crypto market cap
-      - total3   : total mkt cap ex BTC & ETH
+      - btc_d     : BTC dominance (%)
+      - usdt_d    : USDT dominance (%)
+      - total_cap : total crypto market cap
+      - total3    : total cap ex BTC & ETH
     """
     # --- normalize headers & date ---
     df = df_macro.copy()
@@ -64,8 +65,16 @@ def compute_market_level(df_macro: pd.DataFrame) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
 
-    # --- fast path: trust precomputed market_level if provided ---
-    if "market_level" in df.columns:
+    # --- align common header variations to canonical names ---
+    _alias_columns(df, ["btc_d", "btc_dominance", "btcd", "btc_dom", "btc_d_close", "btcdominance"], "btc_d")
+    _alias_columns(df, ["usdt_d", "usdt_dom", "usdtd", "usdt_dominance"], "usdt_d")
+    _alias_columns(df, ["total_cap", "total", "total_mcap", "total_marketcap", "total_mktcap", "totalcap"], "total_cap")
+    _alias_columns(df, ["total3", "total_3", "total3_cap", "total3_mcap", "total_ex_btc_eth"], "total3")
+
+    raw_cols = {"btc_d", "usdt_d", "total_cap", "total3"}
+
+    # --- reuse precomputed market_level ONLY if raw inputs are absent ---
+    if "market_level" in df.columns and not raw_cols.intersection(df.columns):
         out = df[["date", "market_level"]].copy()
         out["market_level"] = (
             pd.to_numeric(out["market_level"], errors="coerce")
@@ -73,21 +82,14 @@ def compute_market_level(df_macro: pd.DataFrame) -> pd.DataFrame:
         )
         return out
 
-    # --- align common header variations to canonical names ---
-    _alias_columns(df, ["btc_d", "btc_dominance", "btcd", "btc_dom", "btc_d_close", "btcdominance"], "btc_d")
-    _alias_columns(df, ["usdt_d", "usdt_dom", "usdtd", "usdt_dominance"], "usdt_d")
-    _alias_columns(df, ["total_cap", "total", "total_mcap", "total_marketcap", "total_mktcap", "totalcap"], "total_cap")
-    _alias_columns(df, ["total3", "total_3", "total3_cap", "total3_mcap", "total_ex_btc_eth"], "total3")
-
-    required = ["btc_d", "usdt_d", "total_cap", "total3"]
-    missing = [c for c in required if c not in df.columns]
+    # --- require raw inputs and make them numeric ---
+    missing = [c for c in raw_cols if c not in df.columns]
     if missing:
         raise KeyError(f"missing macro columns: {missing}. Present: {list(df.columns)}")
 
-    # numeric + gentle gap fill
-    for c in required:
+    for c in raw_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df[required] = df[required].ffill().bfill()
+    df[list(raw_cols)] = df[list(raw_cols)].ffill().bfill()
 
     # --- components (dominances inverted; caps positive) ---
     df["btc_norm"]    = normalize_series(df["btc_d"],  invert=True)
@@ -104,22 +106,17 @@ def compute_market_level(df_macro: pd.DataFrame) -> pd.DataFrame:
     df["avg_raw"] = (df["btc_score"] + df["usdt_score"] + df["total_score"] + df["total3_score"]) / 4.0
     df["avg_smooth"] = (df["avg_raw"] + df["avg_raw"].shift(1)) / 2.0
 
-    # --- map to regimes 1..9 via quantile bucketing (balanced distribution) ---
-    # 8 internal cut points → 9 buckets
+    # --- rank-based bucketing: guaranteed spread across 1..9 ---
     ser = df["avg_smooth"].dropna()
     if ser.empty:
-        # degenerate fallback
         df["market_level"] = 5
     else:
-        qs = [i / 9 for i in range(1, 9)]
-        edges = ser.quantile(qs).tolist()
-        # If edges are not strictly increasing (flat series), fall back to rank-based mapping
-        if len(np.unique(edges)) < len(edges):
-            ranks = df["avg_smooth"].rank(pct=True, method="average")
-            df["market_level"] = np.ceil(ranks * 9).astype("Int64").clip(1, 9).astype(int)
-        else:
-            bins = [-np.inf] + edges + [np.inf]
-            df["market_level"] = pd.cut(df["avg_smooth"], bins=bins, labels=range(1, 10), include_lowest=True).astype(int)
+        ranks = df["avg_smooth"].rank(pct=True, method="average")  # 0..1
+        df["market_level"] = (
+            np.ceil(ranks * 9)    # → 1..9
+              .astype("Int64")
+              .clip(1, 9)
+              .astype(int)
+        )
 
     return df[["date", "market_level"]]
-
