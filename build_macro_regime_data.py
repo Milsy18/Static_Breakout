@@ -3,90 +3,69 @@ from pathlib import Path
 
 RAW = Path("Data/Raw")
 
-def load_series(fname: str, out_name: str, value_col: str | None = None) -> pd.DataFrame:
-    """Load a 2+ column csv, normalize headers, coerce date to daily,
-    collapse duplicate calendar days, and return ['date', out_name]."""
-    p = RAW / fname
-    df = pd.read_csv(p)
+# Accept lots of possible timestamp names
+DATE_CANDIDATES = ("date", "time", "timestamp", "unix", "unixtime", "unix_time", "epoch", "epoch_ms")
 
-    # normalize headers
+def parse_datetime(series: pd.Series) -> pd.DatetimeIndex:
+    """Parse a timestamp series that might be strings or UNIX epoch (s/ms)."""
+    s = series
+    if pd.api.types.is_numeric_dtype(s):
+        s = pd.to_numeric(s, errors="coerce")
+        unit = "ms" if s.dropna().median() > 1e11 else "s"
+        dt = pd.to_datetime(s, unit=unit, utc=True).dt.tz_convert(None)
+    else:
+        dt = pd.to_datetime(s, errors="coerce", utc=True).dt.tz_convert(None)
+    return dt
+
+def load_series(fname: str, out_name: str, value_col: str = "close") -> pd.DataFrame:
+    """
+    Load a CSV with an OHLCV layout, parse timestamp, roll to day, and keep one row/day.
+    value_col defaults to 'close' (works for your files).
+    """
+    df = pd.read_csv(RAW / fname)
     df.columns = [str(c).lower().strip().replace(".", "_") for c in df.columns]
 
-    # find/rename date-like column
-    for cand in ("date", "time", "timestamp"):
-        if cand in df.columns:
-            if cand != "date":
-                df = df.rename(columns={cand: "date"})
-            break
-    else:
-        raise ValueError(f"{fname}: no 'date'/'time'/'timestamp' column found")
+    date_col = next((c for c in DATE_CANDIDATES if c in df.columns), None)
+    if not date_col:
+        raise ValueError(f"{fname}: no date-like column found; saw columns {list(df.columns)}")
 
-    # choose value column if not supplied
-    if value_col is None:
-        # prefer common names; otherwise first non-date column
-        prefs = ["value", "close", out_name]
-        non_date = [c for c in df.columns if c != "date"]
-        for c in prefs:
-            if c in df.columns and c != "date":
-                value_col = c
-                break
-        if value_col is None:
-            value_col = non_date[0]
+    # Parse timestamp → daily
+    dt = parse_datetime(df[date_col]).dt.floor("D")
 
-    # parse datetime and floor to day
-    s = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_convert(None)
-    df["date"] = s.dt.floor("D")
+    # Choose the value column and make numeric
+    if value_col not in df.columns:
+        # fall back to “first non-date column”
+        value_col = next(c for c in df.columns if c != date_col)
+    val = pd.to_numeric(df[value_col], errors="coerce")
 
-    # keep only date + chosen value
-    out = (
-        df[["date", value_col]]
-        .copy()
-        .sort_values("date")
-        .dropna(subset=["date"])
-    )
-
-    # numeric value, allow NaN
-    out[value_col] = pd.to_numeric(out[value_col], errors="coerce")
-
-    # collapse duplicates per calendar day (choose last observation of day)
-    dup_cnt = int(out.duplicated(subset=["date"]).sum())
-    if dup_cnt:
-        print(f"[{fname}] collapsed {dup_cnt} duplicate day rows -> daily using last()")
-    out = out.groupby("date", as_index=False)[value_col].last()
-
-    # rename to unified name
-    out = out.rename(columns={value_col: out_name})
+    out = pd.DataFrame({"date": dt, out_name: val}).dropna(subset=["date"])
+    # Deduplicate within a day (take last non-null per day after sorting)
+    out = out.sort_values("date").groupby("date", as_index=False).last()
     return out
 
 def main():
-    btc   = load_series("btc_d.csv",   "btc_d")
-    usdt  = load_series("usdt_d.csv",  "usdt_d")
-    total = load_series("total.csv",   "total_cap")
-    t3    = load_series("total3.csv",  "total3")
+    btc   = load_series("btc_d.csv",   "btc_d",   value_col="close")
+    usdt  = load_series("usdt_d.csv",  "usdt_d",  value_col="close")
+    total = load_series("total.csv",   "total_cap", value_col="close")
+    t3    = load_series("total3.csv",  "total3",  value_col="close")
 
-    # merge on daily date
-    df = (
-        btc.merge(usdt,  on="date", how="outer")
-           .merge(total, on="date", how="outer")
-           .merge(t3,    on="date", how="outer")
-           .sort_values("date")
-           .reset_index(drop=True)
-    )
+    # Outer-join on calendar day (now unique) and forward/back fill small gaps
+    df = (btc.merge(usdt,  on="date", how="outer")
+             .merge(total, on="date", how="outer")
+             .merge(t3,    on="date", how="outer")
+             .sort_values("date"))
 
-    # forward/back fill across gaps
     for c in ["btc_d", "usdt_d", "total_cap", "total3"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df[["btc_d", "usdt_d", "total_cap", "total3"]] = (
-        df[["btc_d", "usdt_d", "total_cap", "total3"]].ffill().bfill()
-    )
 
-    # nice date format
+    df[["btc_d","usdt_d","total_cap","total3"]] = df[["btc_d","usdt_d","total_cap","total3"]].ffill().bfill()
+
+    # Pretty date for CSV
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
 
     out = RAW / "macro_regime_data.csv"
     df.to_csv(out, index=False)
-    print("wrote", out, "| rows:", len(df), "| cols:", list(df.columns))
+    print(f"wrote {out} rows:{len(df)} cols:{list(df.columns)}")
 
 if __name__ == "__main__":
     main()
-
