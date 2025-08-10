@@ -59,3 +59,6 @@
 ---
 
 _Last updated: 2025-08-10 16:22_
+
+## Auxiliary Files
+- [x] breakout_envelopes.parquet — sha256: 82ABBE9150BE82E65791739210A9E86F0646CCBF3289CD334A22E3EC1946D565
