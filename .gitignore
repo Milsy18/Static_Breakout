@@ -25,3 +25,7 @@ Thumbs.db
 
 # allow processed parquet outputs
 !Data/Processed/**/*.parquet
+
+out/
+
+repo_snapshot.zip
