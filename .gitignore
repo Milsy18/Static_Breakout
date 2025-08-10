@@ -22,3 +22,6 @@ venv/
 # OS/editor
 .DS_Store
 Thumbs.db
+
+# allow processed parquet outputs
+!Data/Processed/**/*.parquet
