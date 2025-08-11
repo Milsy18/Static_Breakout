@@ -1,179 +1,214 @@
-﻿import argparse
+﻿# analyse_confluence.py
+# Finds feature confluence by bar-offset (e.g., @t-1, @t0, @t1) using L1-logistic and simple correlations.
+
+import argparse
+import json
+import os
+import sys
+import warnings
 from pathlib import Path
-import math
+
 import numpy as np
 import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler
 
-# ---- helpers ----
-def suffix_for_offset(o: int) -> str:
-    return f"t{o:+d}".replace("+","+")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-def spearman_to_success(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-    # rank transform (spearman) without scipy
-    ranks = X.rank(method="average")
-    ry = y.rank(method="average")
-    corrs = ranks.corrwith(ry, method="pearson")
-    return corrs.to_frame("spearman_r").sort_values("spearman_r", ascending=False)
+DEFAULT_OFFSETS = [-5, -1, 0, 1, 2, 10]
+KEYS = ["symbol", "entry_date"]   # expected identifier columns
+LABEL_CANDIDATES = ["success_bin", "success", "pct_return"]  # in this order
 
-def simple_auc(scores: np.ndarray, labels: np.ndarray) -> float:
-    # Mann–Whitney U relation to AUC
-    # Handles ties by averaging ranks
-    s = pd.Series(scores)
-    r = s.rank(method="average")
-    n1 = int(labels.sum())
-    n0 = int((1-labels).sum())
-    if n1 == 0 or n0 == 0:
-        return math.nan
-    rank_sum_pos = float(r[labels == 1].sum())
-    U = rank_sum_pos - n1 * (n1 + 1) / 2.0
-    return U / (n1 * n0)
 
-def select_block(df: pd.DataFrame, offsets, include_meta=True):
-    cols = ["symbol","entry_date","market_level","exit_reason","success_bin"] if include_meta else []
-    feat_cols = []
-    for o in offsets:
-        suff = suffix_for_offset(o)
-        feat_cols += [c for c in df.columns if c.endswith(f"_{suff}")]
-    cols += feat_cols
+def load_frame(path: str) -> pd.DataFrame:
+    p = Path(path)
+    if not p.exists():
+        sys.exit(f"[ERR] Input not found: {p}")
+    if p.suffix.lower() == ".parquet":
+        df = pd.read_parquet(p)
+    else:
+        df = pd.read_csv(p, parse_dates=["entry_date", "exit_date"], low_memory=False)
+    # normalize column names a touch
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def pick_label(df: pd.DataFrame) -> tuple[pd.Series, str]:
+    """
+    Returns (y, label_name). Prefers success_bin; falls back to success (bool/0-1) or pct_return > 0.
+    """
+    for col in LABEL_CANDIDATES:
+        if col in df.columns:
+            s = df[col]
+            if col == "pct_return":
+                y = (s.astype(float) > 0).astype(int)
+                return y, "pct_return>0"
+            # try to coerce to {0,1}
+            if s.dtype.kind in "biu":
+                return s.astype(int), col
+            s_str = s.astype(str).str.lower()
+            if s_str.isin(["0", "1", "true", "false", "t", "f", "y", "n"]).any():
+                y = s_str.isin(["1", "true", "t", "y"]).astype(int)
+                return y, col
+    sys.exit("[ERR] Could not determine a label (no success_bin/success/pct_return).")
+
+
+def suffixes_for(off: int) -> list[str]:
+    """
+    Accept both modern '@t{off}' and legacy '@{off}' suffixes.
+    """
+    return [f"@t{off}", f"@{off}"]
+
+
+def feature_columns_for_offset(df: pd.DataFrame, off: int) -> list[str]:
+    """
+    Pick numeric columns whose names end with one of the recognized suffixes for this offset.
+    """
+    cands = []
+    for c in df.columns:
+        name = str(c)
+        if any(name.endswith(suf) for suf in suffixes_for(off)):
+            cands.append(name)
+
+    if not cands:
+        return []
+
+    # try to coerce to numeric to weed out non-numerics
+    tmp = df[cands].apply(pd.to_numeric, errors="coerce")
+    numeric = [c for c in tmp.columns if tmp[c].notna().any()]
+
+    # drop obvious non-features if they slipped through
+    drop_like = set(KEYS + ["exit_reason", "market_level", "market_level_at_entry",
+                            "success", "success_bin", "pct_return"])
+    numeric = [c for c in numeric if c not in drop_like]
+
+    return numeric
+
+
+def maybe_fit_l1(block: pd.DataFrame, feat_cols: list[str], out_csv: Path, label_name: str) -> dict:
+    """
+    Fits L1-logistic on feat_cols to predict y. Writes coefficients CSV.
+    Returns a dict summary.
+    """
+    if len(feat_cols) == 0:
+        return {"n_features": 0, "cv_auc_mean": None, "cv_auc_std": None}
+
+    X_raw = block[feat_cols].apply(pd.to_numeric, errors="coerce").values
+    y = block["_y_"].astype(int).values
+
+    # impute + scale
+    imp = SimpleImputer(strategy="median")
+    X_imp = imp.fit_transform(X_raw)
+    Xs = StandardScaler().fit_transform(X_imp)
+
+    # cross-validated AUC for a sanity metric
+    clf = LogisticRegression(penalty="l1", solver="liblinear", C=1.0, max_iter=2000)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    aucs = cross_val_score(clf, Xs, y, cv=cv, scoring="roc_auc")
+    auc_mean, auc_std = float(np.mean(aucs)), float(np.std(aucs))
+
+    # fit on full for coefficients
+    clf.fit(Xs, y)
+    coefs = clf.coef_.ravel()
+
+    coef_df = pd.DataFrame({
+        "feature": feat_cols,
+        "coef": coefs,
+        "abs_coef": np.abs(coefs),
+    }).sort_values("abs_coef", ascending=False)
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    coef_df.to_csv(out_csv, index=False)
+
+    return {"n_features": int(len(feat_cols)), "cv_auc_mean": auc_mean, "cv_auc_std": auc_std}
+
+
+def simple_correlations(block: pd.DataFrame, feat_cols: list[str], out_csv: Path) -> None:
+    """
+    Writes Pearson correlations of each feature with the label.
+    """
+    if not feat_cols:
+        return
+    y = block["_y_"].astype(float)
+    rows = []
+    for c in feat_cols:
+        s = pd.to_numeric(block[c], errors="coerce")
+        if s.notna().sum() < 3:
+            continue
+        corr = s.corr(y)
+        rows.append((c, corr))
+    corr_df = pd.DataFrame(rows, columns=["feature", "pearson_corr"]).sort_values(
+        "pearson_corr", ascending=False
+    )
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    corr_df.to_csv(out_csv, index=False)
+
+
+def select_block(df: pd.DataFrame, off: int) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Returns (block_df, feature_cols) for a given offset.
+    Keeps useful context columns and the feature set for the offset.
+    """
+    feat_cols = feature_columns_for_offset(df, off)
+    keep = [c for c in KEYS if c in df.columns]
+    for extra in ["exit_reason", "market_level", "market_level_at_entry", "pct_return", "success_bin"]:
+        if extra in df.columns and extra not in keep:
+            keep.append(extra)
+    cols = keep + feat_cols + ["_y_"]
     return df[cols].copy(), feat_cols
 
-def run_univariate(df: pd.DataFrame, feat_cols, out_csv: Path, group_name: str):
-    # Labels
-    y = df["success_bin"].astype(int).values
-    X = df[feat_cols].astype(float)
-
-    # Drop all-NaN or constant features
-    nunique = X.nunique(dropna=True)
-    keep = (nunique > 1)
-    X = X.loc[:, keep]
-    feat_cols = list(X.columns)
-
-    # fill NaNs with median
-    X = X.fillna(X.median(numeric_only=True))
-
-    # Spearman
-    sp = spearman_to_success(X, pd.Series(y))
-    # AUC (per feature)
-    aucs = []
-    for c in X.columns:
-        aucs.append(simple_auc(X[c].values, y))
-    auc = pd.Series(aucs, index=X.columns, name="auc")
-
-    out = pd.concat([sp, auc], axis=1).sort_values(["spearman_r"], ascending=False)
-    out.insert(0, "group", group_name)
-    out.insert(1, "feature", out.index)
-    out.reset_index(drop=True, inplace=True)
-    out.to_csv(out_csv, index=False)
-    return out
-
-def maybe_fit_l1(df: pd.DataFrame, feat_cols, out_csv: Path, group_name: str):
-    try:
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.linear_model import LogisticRegression
-    except Exception as e:
-        Path(out_csv).write_text("sklearn not available; L1 skipped.\n", encoding="utf-8")
-        return None
-
-    y = df["success_bin"].astype(int).values
-    X = df[feat_cols].astype(float)
-
-    # Drop constant cols
-    nunique = X.nunique(dropna=True)
-    keep = (nunique > 1)
-    X = X.loc[:, keep]
-    feat_cols = list(X.columns)
-
-    # Impute + scale
-    X = X.fillna(X.median(numeric_only=True))
-    Xs = StandardScaler().fit_transform(X.values)
-
-    # L1 logistic (sparse selection)
-    clf = LogisticRegression(penalty="l1", solver="liblinear", C=1.0, max_iter=200)
-    clf.fit(Xs, y)
-    coefs = pd.Series(clf.coef_[0], index=feat_cols, name="l1_coef")
-    nonzero = coefs[coefs != 0].sort_values(key=lambda s: s.abs(), ascending=False)
-    out = nonzero.to_frame().reset_index().rename(columns={"index":"feature"})
-    out.insert(0, "group", group_name)
-    out.to_csv(out_csv, index=False)
-    return out
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="Data/Processed/breakout_windows_features.parquet")
-    ap.add_argument("--offsets", type=int, nargs="+", default=[-5, -1, 0, 1, 2, 10])
-    ap.add_argument("--outdir", default="out/analysis")
+    ap.add_argument("--input", required=True, help="Path to labeled wide features (parquet/csv)")
+    ap.add_argument("--outdir", required=True, help="Output directory for analysis CSVs")
+    ap.add_argument("--offsets", nargs="*", type=int, default=DEFAULT_OFFSETS,
+                    help="Offsets to analyze (e.g. -5 -1 0 1 2 10)")
     args = ap.parse_args()
 
-    inp = Path(args.input)
-    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_parquet(inp)
+    df = load_frame(args.input)
 
-    # A) Per-offset analysis (univariate + L1 if available)
-    all_univar = []
-    for o in args.offsets:
-        block, feats = select_block(df, [o])
-        name = f"offset_{o:+d}"
-        uv_path = outdir / f"univar_{name}.csv"
-        l1_path = outdir / f"l1_{name}.csv"
-        print(f"Running {name}: {len(feats)} features")
-        out_uv = run_univariate(block, feats, uv_path, name)
-        all_univar.append(out_uv)
-        maybe_fit_l1(block, feats, l1_path, name)
+    # build / attach label
+    y, label_name = pick_label(df)
+    df = df.copy()
+    df["_y_"] = y.values
 
-    pd.concat(all_univar).to_csv(outdir / "top_features_by_offset.csv", index=False)
+    summary = {}
+    for off in args.offsets:
+        # choose features for this offset (by suffix)
+        feats = feature_columns_for_offset(df, off)
+        print(f"Offset {off}: {len(feats)} features")
+        block, feat_cols = select_block(df, off)
 
-    # B) Regime-aware (univariate only to keep it fast)
-    if "market_level" in df.columns:
-        regimes = sorted([x for x in df["market_level"].dropna().unique().tolist() if str(x) != "nan"])
-        rows = []
-        for o in args.offsets:
-            suff = suffix_for_offset(o)
-            feat_cols = [c for c in df.columns if c.endswith(f"_{suff}")]
-            for reg in regimes:
-                sub = df.loc[df["market_level"] == reg, ["success_bin"] + feat_cols]
-                if len(sub) < 50:
-                    continue
-                out = run_univariate(sub, feat_cols, outdir / f"univar_regime_{reg}_offset_{o:+d}.csv", f"regime_{reg}_offset_{o:+d}")
-                rows.append(out)
-        if rows:
-            pd.concat(rows).to_csv(outdir / "confluence_by_regime.csv", index=False)
+        # files per offset
+        l1_csv = outdir / f"l1_coefs_t{off}.csv"
+        cor_csv = outdir / f"correlations_t{off}.csv"
 
-    # C) TIME vs TP (if TP exists)
-    if "exit_reason" in df.columns:
-        has_tp = (df["exit_reason"].fillna("").str.upper() == "TP").any()
-        if has_tp:
-            rows = []
-            for o in args.offsets:
-                suff = suffix_for_offset(o)
-                feats = [c for c in df.columns if c.endswith(f"_{suff}")]
-                a = df.loc[df["exit_reason"].str.upper()=="TIME", feats].astype(float)
-                b = df.loc[df["exit_reason"].str.upper()=="TP", feats].astype(float)
-                if len(a) >= 30 and len(b) >= 30:
-                    mu_a = a.mean()
-                    mu_b = b.mean()
-                    delta = (mu_b - mu_a)
-                    # pooled sd for Cohen's d
-                    sd = pd.concat([a, b]).std()
-                    d = delta / sd.replace(0, np.nan)
-                    out = pd.DataFrame({
-                        "feature": feats,
-                        "offset": o,
-                        "mean_TIME": mu_a.values,
-                        "mean_TP": mu_b.values,
-                        "delta": delta.values,
-                        "cohen_d": d.values,
-                        "n_TIME": len(a),
-                        "n_TP": len(b)
-                    })
-                    out.to_csv(outdir / f"exit_reason_diffs_offset_{o:+d}.csv", index=False)
-                    rows.append(out)
-            if rows:
-                pd.concat(rows).to_csv(outdir / "exit_reason_diffs.csv", index=False)
-        else:
-            (outdir / "exit_reason_diffs.csv").write_text("No TP rows present; skipped.\n", encoding="utf-8")
+        # correlations
+        simple_correlations(block, feat_cols, cor_csv)
 
-    print("✅ Analysis complete. See:", outdir)
+        # l1
+        stats = maybe_fit_l1(block, feat_cols, l1_csv, label_name)
+        summary[str(off)] = {
+            "n_features": stats["n_features"],
+            "cv_auc_mean": stats["cv_auc_mean"],
+            "cv_auc_std": stats["cv_auc_std"],
+            "label": label_name,
+        }
+
+    # write a run summary
+    with open(outdir / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print("\n=== Done ===")
+    print(json.dumps(summary, indent=2))
+
 
 if __name__ == "__main__":
     main()

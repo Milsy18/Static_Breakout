@@ -1,98 +1,67 @@
 ﻿import argparse
-from functools import reduce
-from pathlib import Path
-import re
-import json
 import pandas as pd
-import numpy as np
+from pathlib import Path
 
-def suffix_for_offset(o: int) -> str:
-    return f"t{o:+d}".replace("+", "+")  # t-5, t-1, t0, t+1, ...
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--src", required=True)
+    p.add_argument("--offsets", nargs="+", type=int, required=True)
+    p.add_argument("--outdir", required=True)
+    return p.parse_args()
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="Data/Processed/labeled_holy_grail_static_221_windows_long.parquet")
-    ap.add_argument("--offsets", type=int, nargs="+", default=[-5, -1, 0, 1, 2, 10])
-    ap.add_argument("--outdir", default="Data/Processed")
-    args = ap.parse_args()
+    a = parse_args()
+    outdir = Path(a.outdir); outdir.mkdir(parents=True, exist_ok=True)
 
-    src = Path(args.src)
-    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_parquet(a.src)
 
-    df = pd.read_parquet(src)
-    # Ensure types
-    if "entry_date" in df.columns:
-        df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
-    if "exit_time" in df.columns:
-        df["exit_time"] = pd.to_datetime(df["exit_time"], errors="coerce")
-    if "bar_offset" in df.columns:
-        df["bar_offset"] = pd.to_numeric(df["bar_offset"], errors="coerce").astype("Int32")
+    # Clean offsets and drop the NaT-like row
+    df["bar_offset"] = pd.to_numeric(df["bar_offset"], errors="coerce")
+    df = df.dropna(subset=["bar_offset"]).copy()
+    df["bar_offset"] = df["bar_offset"].astype("int64")
 
-    # Metadata columns we want to keep (only those that actually exist)
-    meta_wanted = [
-        "symbol","entry_date","entry_price","market_level","bar_offset",
-        "score_trd","score_vty","score_vol","score_mom","score_total","score_norm",
-        "exit_time","exit_price","exit_reason","exit_label","success_bin"
-    ]
-    meta_cols = [c for c in meta_wanted if c in df.columns]
-
-    # Feature detection: numeric columns that are not metadata
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    feature_cols = [c for c in numeric_cols if c not in meta_cols and c != "bar_offset"]
-
-    # Persist feature list
-    (outdir / "feature_columns.json").write_text(json.dumps(feature_cols, indent=2), encoding="utf-8")
-
-    # --- Build wide table across selected offsets ---
-    keys = ["symbol","entry_date"]
+    keys = ["symbol", "entry_date"]
     for k in keys:
         if k not in df.columns:
-            raise SystemExit(f"Missing key column '{k}' in {src}")
+            raise SystemExit(f"Required key column missing: {k}")
 
-    frames = []
-    for o in args.offsets:
-        dfo = df.loc[df["bar_offset"] == o, keys + feature_cols].copy()
-        # rename features with suffix by offset
-        suff = suffix_for_offset(o)
-        dfo = dfo.rename(columns={c: f"{c}_{suff}" for c in feature_cols})
-        frames.append(dfo)
+    # Limit to requested offsets
+    df = df[df["bar_offset"].isin(set(a.offsets))].copy()
 
-    # Inner-join across offsets so each row = one breakout with all offsets present
-    wide = reduce(lambda l, r: pd.merge(l, r, on=keys, how="inner"), frames)
+    # De-dup
+    df = (df.sort_values(keys + ["bar_offset"])
+            .drop_duplicates(subset=keys + ["bar_offset"]))
 
-    # Attach labels/meta from t0 row
-    base_cols = [c for c in meta_cols if c not in ["bar_offset"]]  # no need to carry bar_offset now
-    base = df.loc[df["bar_offset"] == 0, keys + base_cols].drop_duplicates(keys)
-    wide = pd.merge(wide, base, on=keys, how="left")
+    # Candidate features = numeric columns excluding non-features
+    exclude = set(keys + ["index", "bar_offset",
+                          "exit_time", "exit_price", "exit_reason",
+                          "exit_label", "success_bin"])
+    # Try to coerce numerics broadly
+    candidates = [c for c in df.columns if c not in exclude]
+    df[candidates] = df[candidates].apply(pd.to_numeric, errors="ignore")
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    feats = [c for c in numeric_cols if c not in exclude]
 
-    # Sort columns: keys, labels/meta, then features grouped by offset
-    def sort_key(c):
-        if c in keys: return (0, c)
-        if c in base_cols: return (1, c)
-        m = re.search(r"_(t[+\-]?\d+)$", c)
-        if m:
-            s = m.group(1)  # e.g., t-1
-            try:
-                off = int(s.replace("t",""))
-            except:
-                off = 9999
-            return (2, off, c)
-        return (3, c)
+    # Fallback if nothing detected
+    if not feats:
+        fallback = ["score_trd","score_vty","score_vol","score_mom",
+                    "score_total","score_norm","market_level"]
+        feats = [c for c in fallback if c in df.columns]
+        if not feats:
+            raise SystemExit("No feature columns found after filtering.")
 
-    cols_sorted = sorted(wide.columns, key=sort_key)
-    wide = wide[cols_sorted]
+    # Pivot wide per offset
+    wide = (df.set_index(keys + ["bar_offset"])[feats]
+              .unstack("bar_offset"))
+    wide.columns = [f"{feat}@t{int(off)}" for feat, off in wide.columns]
+    wide = wide.reset_index()
 
-    # Save outputs
-    out_parquet = outdir / "breakout_windows_features.parquet"
-    wide.to_parquet(out_parquet, index=False)
-
-    # Also drop a tiny sample CSV for eyeballing (first 100 rows, 200 cols max)
-    sample_cols = cols_sorted[:min(200, len(cols_sorted))]
-    out_sample = outdir / "breakout_windows_features_sample.csv"
-    wide[sample_cols].head(100).to_csv(out_sample, index=False)
-
-    print(f"✅ Built {out_parquet} with shape {wide.shape}")
-    print(f"📝 Sample: {out_sample}")
+    p_parq = outdir / "breakout_windows_features.parquet"
+    p_csv  = outdir / "breakout_windows_features_sample.csv"
+    wide.to_parquet(p_parq, index=False)
+    wide.head(50).to_csv(p_csv, index=False)
+    print(f"✅ Built {p_parq} with shape {tuple(wide.shape)}")
+    print(f"📝 Sample: {p_csv}")
 
 if __name__ == "__main__":
     main()
