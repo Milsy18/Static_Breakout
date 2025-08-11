@@ -1,0 +1,27 @@
+{
+  "tp_map": {
+    "1": 0.22,
+    "2": 0.25,
+    "3": 0.28,
+    "4": 0.3,
+    "5": 0.33,
+    "6": 0.36,
+    "7": 0.4,
+    "8": 0.42,
+    "9": 0.45
+  },
+  "ttl_map": {
+    "1": 5,
+    "2": 6,
+    "3": 6,
+    "4": 7,
+    "5": 8,
+    "6": 9,
+    "7": 10,
+    "8": 11,
+    "9": 11
+  },
+  "entry_fill": "next_open",
+  "breakouts_source": "C:\\Users\\milla\\static_breakout\\Static_Breakout\\Data\\Processed\\static_breakouts.csv",
+  "prices_root": "C:\\Users\\milla\\OneDrive\\Documents\\GitHub\\Static_Breakout_ARCHIVE_2025-08-08\\Data\\Filtered_OHLCV"
+}
