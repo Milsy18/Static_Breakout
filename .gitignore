@@ -29,3 +29,6 @@ Thumbs.db
 out/
 
 repo_snapshot.zip
+
+# publish breakout payload
+!Data/Processed/static_breakouts.csv
