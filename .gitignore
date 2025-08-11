@@ -32,3 +32,10 @@ repo_snapshot.zip
 
 # publish breakout payload
 !Data/Processed/static_breakouts.csv
+# Local scratch / big outputs
+repo_snapshot.zip
+Data/Processed/expectancy/
+Data/Processed/baseline_stats/
+Data/Processed/yearly_pnl/
+out/optim/*
+!out/optim/latest/
