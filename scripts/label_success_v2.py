@@ -1,5 +1,5 @@
 ﻿#!/usr/bin/env python3
-# label_success_v2.py — Business labels for M18 breakouts (fast, cached OHLCV)
+# label_success_v2.py — Business labels for M18 breakouts (fast, numeric-coerced OHLCV)
 
 import argparse, os, json
 from pathlib import Path
@@ -47,6 +47,7 @@ def extract_t0_features(wide: pd.DataFrame) -> pd.DataFrame:
     t0=wide[sorted(set(base+t0_cols))].copy()
     return drop_price_like(t0)
 
+# === Hardened OHLCV loader with numeric coercion ===
 _OHLCV_CACHE={}
 def load_ohlcv(prices_root: Path, symbol: str) -> pd.DataFrame:
     if symbol in _OHLCV_CACHE: return _OHLCV_CACHE[symbol]
@@ -58,14 +59,18 @@ def load_ohlcv(prices_root: Path, symbol: str) -> pd.DataFrame:
         if p.exists():
             df=pd.read_csv(p)
             df.columns=[c.strip().lower() for c in df.columns]
-            if "date" in df.columns: df["date"]=pd.to_datetime(df["date"])
-            elif "timestamp" in df.columns: df["date"]=pd.to_datetime(df["timestamp"])
+            if "date" in df.columns: df["date"]=pd.to_datetime(df["date"], errors="coerce")
+            elif "timestamp" in df.columns: df["date"]=pd.to_datetime(df["timestamp"], errors="coerce")
             else: raise KeyError(f"{p}: need date or timestamp")
-            need={"open","high","low","close"}
-            if not need.issubset(df.columns): raise KeyError(f"{p}: missing OHLC")
-            out=df[["date","open","high","low","close","volume"]].sort_values("date").reset_index(drop=True)
-            _OHLCV_CACHE[symbol]=out
-            return out
+            for c in ["open","high","low","close","volume"]:
+                if c in df.columns:
+                    df[c]=pd.to_numeric(df[c], errors="coerce")
+                else:
+                    raise KeyError(f"{p}: missing column '{c}'")
+            # Drop any bad lines (e.g., the weird first row with text)
+            df=df.dropna(subset=["date","open","high","low","close"]).sort_values("date").reset_index(drop=True)
+            _OHLCV_CACHE[symbol]=df[["date","open","high","low","close","volume"]]
+            return _OHLCV_CACHE[symbol]
     raise FileNotFoundError(f"OHLCV not found for '{symbol}' under {prices_root}")
 
 def main():
@@ -94,10 +99,11 @@ def main():
     for symbol, grp in bo.groupby("symbol", sort=False):
         try:
             ohlcv=load_ohlcv(prices_root, symbol)
+            dates=ohlcv["date"].to_numpy()
         except Exception as e:
             errors.append((symbol, f"load_ohlcv: {e}"))
             continue
-        dates=ohlcv["date"].to_numpy()
+
         for _, row in grp.iterrows():
             try:
                 entry_time=pd.to_datetime(row[time_col])
@@ -107,7 +113,6 @@ def main():
                 TP=tp_map.get(mlev, tp_map[5])
                 TTL=int(ttl_map.get(mlev, ttl_map[5]))
 
-                # entry index = first date >= entry_time
                 idx_arr=np.where(dates>=entry_time.to_datetime64())[0]
                 if idx_arr.size==0: raise IndexError(f"no bar >= entry_time")
                 idx=int(idx_arr.min())
@@ -126,26 +131,15 @@ def main():
                 mfe=(np.max(hi)/entry_px)-1.0
                 mae=(np.min(lo)/entry_px)-1.0
 
-                tp_levels=hi/entry_px-1.0
-                hit=np.where(tp_levels>=TP)[0]
+                hit=np.where(hi/entry_px-1.0>=TP)[0]
                 if hit.size>0:
-                    bars_to_tp=int(hit[0]+1); tp_hit=True; exit_reason="TP"
+                    rows.append({"symbol":symbol,"entry_time":entry_time,"market_level_at_entry":row.get("market_level_at_entry", np.nan),
+                                 "tp_hit":True,"bars_to_tp":int(hit[0]+1),"ttl_return":float(cl/entry_px-1.0),
+                                 "mfe":mfe,"mae":mae,"exit_reason_label":"TP"})
                 else:
-                    bars_to_tp=np.nan; tp_hit=False; exit_reason="TIME"
-
-                ttl_return=float(cl/entry_px-1.0)
-
-                rows.append({
-                    "symbol": symbol,
-                    "entry_time": entry_time,
-                    "market_level_at_entry": row.get("market_level_at_entry", np.nan),
-                    "tp_hit": bool(tp_hit),
-                    "bars_to_tp": bars_to_tp,
-                    "ttl_return": ttl_return,
-                    "mfe": mfe,
-                    "mae": mae,
-                    "exit_reason_label": exit_reason,
-                })
+                    rows.append({"symbol":symbol,"entry_time":entry_time,"market_level_at_entry":row.get("market_level_at_entry", np.nan),
+                                 "tp_hit":False,"bars_to_tp":np.nan,"ttl_return":float(cl/entry_px-1.0),
+                                 "mfe":mfe,"mae":mae,"exit_reason_label":"TIME"})
             except Exception as e:
                 errors.append((symbol, str(e)))
 
@@ -168,7 +162,7 @@ def main():
     tp_rate=float(labels["tp_hit"].mean()) if labeled else 0.0
     print(f"[label_success_v2] processed={total}, labeled={labeled}, tp_rate={tp_rate:.3f}")
     if errors:
-        print(f"[label_success_v2] {len(errors)} rows skipped or errored (showing first 10):")
+        print(f"[label_success_v2] {len(errors)} rows skipped or errored (first 10):")
         for e in errors[:10]: print("  ->", e)
 
     cfg_path=str(Path(args.out).with_suffix(""))+"_config.json"
