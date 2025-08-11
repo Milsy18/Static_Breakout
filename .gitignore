@@ -39,3 +39,6 @@ Data/Processed/baseline_stats/
 Data/Processed/yearly_pnl/
 out/optim/*
 !out/optim/latest/
+# Local scratch
+scripts/pine/
+tmp_*.py
