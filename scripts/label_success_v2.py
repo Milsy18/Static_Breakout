@@ -1,7 +1,8 @@
 ﻿#!/usr/bin/env python3
 # label_success_v2.py — Business labels for M18 breakouts (fast, numeric-coerced OHLCV)
+# + strict t0-only feature join (purge non-t0, drop price-like but keep label cols)
 
-import argparse, os, json
+import argparse, os, json, re
 from pathlib import Path
 from typing import Dict, Optional
 import numpy as np
@@ -11,7 +12,12 @@ DEFAULT_TP_MAP = {1:0.22,2:0.25,3:0.28,4:0.30,5:0.33,6:0.36,7:0.40,8:0.42,9:0.45
 DEFAULT_TTL_MAP = {1:5,2:6,3:6,4:7,5:8,6:9,7:10,8:11,9:11}
 
 PRICE_LIKE_PATTERNS = ("price","open","high","low","close","hlc3","ohlc4","return","ret_","rtn_","pct",
-                       "gain","loss","drawdown","dd_","pnl","r_","perf","change")
+                       "gain","loss","drawdown","dd_","pnl","r_","perf","change","entry_price","exit_price")
+
+ALLOWED_LABEL_COLS = {
+    "symbol","entry_time","market_level_at_entry","breakout_id",
+    "tp_hit","ttl_return","mfe","mae","bars_to_tp","exit_reason_label"
+}
 
 def parse_mapping(s: Optional[str], default: Dict[int,float], name: str) -> Dict[int,float]:
     if not s: return default
@@ -29,25 +35,7 @@ def detect_time_col(df: pd.DataFrame) -> str:
         if c in df.columns: return c
     raise KeyError("Could not find an entry time column.")
 
-def drop_price_like(df: pd.DataFrame) -> pd.DataFrame:
-    keep=[]
-    for c in df.columns:
-        lc=c.lower()
-        if any(tok in lc for tok in PRICE_LIKE_PATTERNS): continue
-        keep.append(c)
-    return df[keep]
-
-def extract_t0_features(wide: pd.DataFrame) -> pd.DataFrame:
-    cols=list(wide.columns)
-    t0_cols=[c for c in cols if c.endswith("_t0") or c.startswith("t0_") or "_t0_" in c]
-    if not t0_cols:
-        t_markers=("_t-","_tm","_t1","_t2","_t3","_t4","_t5","_t6","_t7","_t8","_t9","_t10","_t11")
-        t0_cols=[c for c in cols if all(m not in c for m in t_markers)]
-    base=[c for c in ["symbol","entry_time","entry_ts","entry_date","date","market_level_at_entry","breakout_id"] if c in cols]
-    t0=wide[sorted(set(base+t0_cols))].copy()
-    return drop_price_like(t0)
-
-# === Hardened OHLCV loader with numeric coercion ===
+# ---------- OHLCV loading (coerce to numeric; drop bad rows) ----------
 _OHLCV_CACHE={}
 def load_ohlcv(prices_root: Path, symbol: str) -> pd.DataFrame:
     if symbol in _OHLCV_CACHE: return _OHLCV_CACHE[symbol]
@@ -63,16 +51,57 @@ def load_ohlcv(prices_root: Path, symbol: str) -> pd.DataFrame:
             elif "timestamp" in df.columns: df["date"]=pd.to_datetime(df["timestamp"], errors="coerce")
             else: raise KeyError(f"{p}: need date or timestamp")
             for c in ["open","high","low","close","volume"]:
-                if c in df.columns:
-                    df[c]=pd.to_numeric(df[c], errors="coerce")
-                else:
-                    raise KeyError(f"{p}: missing column '{c}'")
-            # Drop any bad lines (e.g., the weird first row with text)
+                if c not in df.columns: raise KeyError(f"{p}: missing column '{c}'")
+                df[c]=pd.to_numeric(df[c], errors="coerce")
             df=df.dropna(subset=["date","open","high","low","close"]).sort_values("date").reset_index(drop=True)
             _OHLCV_CACHE[symbol]=df[["date","open","high","low","close","volume"]]
             return _OHLCV_CACHE[symbol]
     raise FileNotFoundError(f"OHLCV not found for '{symbol}' under {prices_root}")
 
+# ---------- Feature hygiene helpers ----------
+def drop_price_like_keep_labels(df: pd.DataFrame) -> pd.DataFrame:
+    keep=[]
+    for c in df.columns:
+        if c in ALLOWED_LABEL_COLS: keep.append(c); continue
+        lc=c.lower()
+        if any(tok in lc for tok in PRICE_LIKE_PATTERNS): continue
+        keep.append(c)
+    return df[keep]
+
+def purge_non_t0_offsets(df: pd.DataFrame) -> pd.DataFrame:
+    keep=[]
+    for c in df.columns:
+        if c in ALLOWED_LABEL_COLS: keep.append(c); continue
+        lc=c.lower()
+        m=re.search(r'@t(-?\d+)|_t(\d+)|t\+(\d+)', lc)
+        if not m:
+            keep.append(c); continue
+        g = next((g for g in m.groups() if g is not None), None)
+        try: n=int(g)
+        except: n=None
+        if n==0: keep.append(c)
+    return df[keep]
+
+def extract_t0_features(wide: pd.DataFrame) -> pd.DataFrame:
+    cols = list(wide.columns)
+    base_cols = [c for c in ["symbol","entry_time","entry_ts","entry_date","date",
+                             "market_level_at_entry","breakout_id"] if c in cols]
+
+    def is_t0(c: str) -> bool:
+        lc = c.lower()
+        if lc.startswith("t0_") or lc.endswith("_t0") or "_t0_" in lc or "@t0" in lc:
+            return True
+        if re.search(r"@t-?\d+|_t\d+|t\+\d+", lc):
+            return False
+        return True
+
+    t0_cols = [c for c in cols if is_t0(c)]
+    t0 = wide[sorted(set(base_cols + t0_cols))].copy()
+    t0 = purge_non_t0_offsets(t0)
+    t0 = drop_price_like_keep_labels(t0)
+    return t0
+
+# ---------- Label computation ----------
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--breakouts", required=True)
@@ -114,7 +143,7 @@ def main():
                 TTL=int(ttl_map.get(mlev, ttl_map[5]))
 
                 idx_arr=np.where(dates>=entry_time.to_datetime64())[0]
-                if idx_arr.size==0: raise IndexError(f"no bar >= entry_time")
+                if idx_arr.size==0: raise IndexError("no bar >= entry_time")
                 idx=int(idx_arr.min())
 
                 if args.entry_fill=="close_at_entry":
@@ -130,7 +159,6 @@ def main():
 
                 mfe=(np.max(hi)/entry_px)-1.0
                 mae=(np.min(lo)/entry_px)-1.0
-
                 hit=np.where(hi/entry_px-1.0>=TP)[0]
                 if hit.size>0:
                     rows.append({"symbol":symbol,"entry_time":entry_time,"market_level_at_entry":row.get("market_level_at_entry", np.nan),
@@ -156,10 +184,12 @@ def main():
         t0["entry_time"]=pd.to_datetime(t0["entry_time"])
         merged=(t0.merge(labels, on=["symbol","entry_time"], how="inner")
                   .drop_duplicates(subset=["symbol","entry_time"]))
-        merged = purge_non_t0_offsets(merged)\n        merged = drop_price_like_keep_labels(merged)\n        merged.to_parquet(args.out_features, index=False)
+        # Final hygiene: purge any non-t0 offsets & drop price-like (keep labels)
+        merged = purge_non_t0_offsets(merged)
+        merged = drop_price_like_keep_labels(merged)
+        merged.to_parquet(args.out_features, index=False)
 
-    total=len(bo); labeled=len(labels)
-    tp_rate=float(labels["tp_hit"].mean()) if labeled else 0.0
+    total=len(bo); labeled=len(labels); tp_rate=float(labels["tp_hit"].mean()) if labeled else 0.0
     print(f"[label_success_v2] processed={total}, labeled={labeled}, tp_rate={tp_rate:.3f}")
     if errors:
         print(f"[label_success_v2] {len(errors)} rows skipped or errored (first 10):")
@@ -175,43 +205,3 @@ def main():
 
 if __name__=="__main__":
     main()
-
-
-# === HARD PURGE HELPERS (append into label_success_v2.py) ===
-ALLOWED_LABEL_COLS = {
-  "symbol","entry_time","market_level_at_entry","breakout_id",
-  "tp_hit","ttl_return","mfe","mae","bars_to_tp","exit_reason_label"
-}
-
-def drop_price_like_keep_labels(df: pd.DataFrame) -> pd.DataFrame:
-    keep=[]
-    for c in df.columns:
-        lc=c.lower()
-        if c in ALLOWED_LABEL_COLS:
-            keep.append(c); continue
-        if any(tok in lc for tok in PRICE_LIKE_PATTERNS):
-            continue
-        keep.append(c)
-    return df[keep]
-
-def purge_non_t0_offsets(df: pd.DataFrame) -> pd.DataFrame:
-    import re
-    keep=[]
-    for c in df.columns:
-        if c in ALLOWED_LABEL_COLS:
-            keep.append(c); continue
-        lc=c.lower()
-        m=re.search(r'@t(-?\d+)|_t(\d+)|t\+(\d+)', lc)
-        if not m:
-            keep.append(c); continue
-        # extract the first matched integer
-        g = next((g for g in m.groups() if g is not None), None)
-        try:
-            n=int(g)
-        except:
-            n=None
-        if n==0:
-            keep.append(c)  # explicit t0
-        # else: drop
-    return df[keep]
-
