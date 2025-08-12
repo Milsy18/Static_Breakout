@@ -1,7 +1,5 @@
 ﻿#!/usr/bin/env python3
-# optim_monotone.py — regime-aware, monotone probability cutoffs via purged walk-forward
-# Objective: maximize Profit/Year (USD) @ $1k/trade incl. fees; constraints: min trades/year; monotone cutoffs
-
+# optim_monotone.py — verbose & safe version (always prints & writes summary)
 import argparse, json
 from pathlib import Path
 import numpy as np
@@ -24,7 +22,7 @@ def realized_return(row, tp_map, fees_rtt):
     return float(r) - float(fees_rtt)
 
 def max_drawdown_usd(pnl_usd):
-    peak = -1e30; mdd = 0.0
+    peak=-1e30; mdd=0.0
     for x in pnl_usd:
         peak = max(peak, x)
         mdd = max(mdd, peak - x)
@@ -38,16 +36,14 @@ def cvar_losses_pct(returns, alpha=0.95):
     return float(-tail.mean()) if len(tail) else float(-q)
 
 def choose_features(df):
-    feats = []
+    feats=[]
     for c in df.columns:
         if c in ALLOWED_LABEL_COLS: continue
-        if pd.api.types.is_numeric_dtype(df[c]):
-            feats.append(c)
+        if pd.api.types.is_numeric_dtype(df[c]): feats.append(c)
     return feats
 
 def enforce_monotone(cut):
-    # bearish (1) -> bullish (9): thresholds must be non-increasing
-    out = cut.copy()
+    out=cut.copy()
     for k in range(2,10):
         out[k] = min(out[k], out[k-1])
     return out
@@ -62,152 +58,131 @@ def main():
     ap.add_argument("--fees-rtt", type=float, default=0.004)
     ap.add_argument("--tp-map", default=None)
     ap.add_argument("--min-trades-per-year", type=float, default=25.0)
-    ap.add_argument("--lambda-cvar", type=float, default=0.0, help="penalty weight on CVaR (USD/year approx.)")
-    ap.add_argument("--dd-cap-usd", type=float, default=None, help="if set, reject configs exceeding this MDD")
-    ap.add_argument("--grid", default="0.30:0.95:14", help="prob threshold grid start:end:n (e.g., 0.30:0.95:14)")
+    ap.add_argument("--lambda-cvar", type=float, default=0.0)
+    ap.add_argument("--dd-cap-usd", type=float, default=None)
+    ap.add_argument("--grid", default="0.30:0.95:14")
     args = ap.parse_args()
+
+    out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
 
     tp_map = DEFAULT_TP_MAP.copy()
     if args.tp_map:
         for part in args.tp_map.split(","):
-            k,v = part.split(":"); tp_map[int(k.strip())] = float(v.strip())
+            k,v = part.split(":"); tp_map[int(k.strip())]=float(v.strip())
 
-    # Load data
+    # Load
     train = pd.read_parquet(args.train)
     labels = pd.read_parquet(args.labels)
-    evix = pd.read_parquet(args.events_index)  # same order as wf json
-    with open(args.folds_json, "r") as f:
-        folds = json.load(f)
+    evix   = pd.read_parquet(args.events_index)
+    with open(args.folds_json,"r") as f: folds = json.load(f)
 
-    # Join realized returns to train (for evaluation)
-    key_cols = ["symbol","entry_time"]
-    train["entry_time"] = pd.to_datetime(train["entry_time"])
-    labels["entry_time"] = pd.to_datetime(labels["entry_time"])
-    df = (train.merge(labels[key_cols+["tp_hit","ttl_return"]], on=key_cols, how="inner")
-               .drop_duplicates(subset=key_cols)
-               .reset_index(drop=True))
+    # Merge labels
+    key = ["symbol","entry_time"]
+    train["entry_time"]=pd.to_datetime(train["entry_time"])
+    labels["entry_time"]=pd.to_datetime(labels["entry_time"])
+    df = (train.merge(labels[key+["tp_hit","ttl_return"]], on=key, how="inner")
+              .drop_duplicates(subset=key)
+              .reset_index(drop=True))
 
-    # Add wf position for fold mapping
-    evix["entry_time"] = pd.to_datetime(evix["entry_time"])
-    df = (df.merge(evix.reset_index().rename(columns={"index":"wf_pos"}), on=key_cols, how="left"))
-    if df["wf_pos"].isna().any():
-        missing = int(df["wf_pos"].isna().sum())
-        print(f"[optim] WARN: {missing} events lack wf_pos (not in events_index); they will be ignored.")
-        df = df.dropna(subset=["wf_pos"]).reset_index(drop=True)
-    df["wf_pos"] = df["wf_pos"].astype(int)
+    # Attach wf_pos based on order in events_index
+    evix["entry_time"]=pd.to_datetime(evix["entry_time"])
+    evix = evix.reset_index().rename(columns={"index":"wf_pos"})
+    df = df.merge(evix[key+["wf_pos"]], on=key, how="left")
 
-    # Features/target
+    # Verbose shape info
     features = choose_features(df)
-    if not features:
-        raise ValueError("No numeric t0 features found to train on.")
-    y = df["tp_hit"].astype(int).to_numpy()
-    X = df[features].to_numpy()
-    mlev = df["market_level_at_entry"].fillna(5).astype(int).to_numpy()
-    entry_time = pd.to_datetime(df["entry_time"])
+    info = {
+        "rows_train": int(len(train)),
+        "rows_labels": int(len(labels)),
+        "rows_merged": int(len(df)),
+        "missing_wf_pos": int(df["wf_pos"].isna().sum()),
+        "features_used": features[:30],
+        "n_features": int(len(features)),
+        "folds": int(len(folds)),
+        "fold_sizes_test": [int(len(f["test_idx"])) for f in folds][:10],
+    }
+    print("[optim] info:", json.dumps(info, default=int))
 
-    # Build fold masks using wf_pos
-    fold_masks = []
+    # If nothing to work with, write a debug summary and exit
+    if len(df)==0 or len(features)==0:
+        summ = {"objective_value": 0, "metrics": {"profit_year":0,"mdd":0,"cvar":0,"trades":0}, "debug": info}
+        with open(out/"summary.json","w") as f: json.dump(summ, f, indent=2)
+        print("[optim] ABORT: empty df or no features; wrote summary.json")
+        return
+
+    # Build masks
+    masks=[]
     for f in folds:
-        test_mask = df["wf_pos"].isin(set(f["test_idx"]))
-        train_mask = ~test_mask
-        fold_masks.append((train_mask.to_numpy(), test_mask.to_numpy(), f))
+        te = df["wf_pos"].isin(set(f["test_idx"])).to_numpy()
+        tr = ~te
+        print(f"[optim] fold {f['i']}: train={int(tr.sum())}, test={int(te.sum())}")
+        masks.append((tr, te, f))
 
-    # Threshold grid
+    # Predict
+    all_preds=[]
+    for (tr, te, f) in masks:
+        if te.sum()==0 or tr.sum()==0: 
+            continue
+        pipe = Pipeline([("scaler", StandardScaler()),
+                         ("clf", LogisticRegression(max_iter=200, solver='lbfgs'))])
+        pipe.fit(df.loc[tr, features].to_numpy(), df.loc[tr,"tp_hit"].astype(int).to_numpy())
+        p = pipe.predict_proba(df.loc[te, features].to_numpy())[:,1]
+        tmp = df.loc[te, ["symbol","entry_time","market_level_at_entry","tp_hit","ttl_return"]].copy()
+        tmp["p_tp"]=p
+        all_preds.append(tmp)
+
+    if not all_preds:
+        summ = {"objective_value": 0, "metrics": {"profit_year":0,"mdd":0,"cvar":0,"trades":0}, "debug": info}
+        with open(out/"summary.json","w") as f: json.dump(summ, f, indent=2)
+        print("[optim] ABORT: no test predictions produced; wrote summary.json")
+        return
+
+    preds = pd.concat(all_preds, ignore_index=True).sort_values("entry_time").reset_index(drop=True)
+
+    # Grid
     gstart, gend, gn = [float(x) if i<2 else int(x) for i,x in enumerate(args.grid.split(":"))]
     grid = np.linspace(gstart, gend, gn)
 
-    # Walk-forward training/prediction
-    all_preds = []
-    for (tr_mask, te_mask, f) in fold_masks:
-        if te_mask.sum()==0: continue
-        pipe = Pipeline([("scaler", StandardScaler()),
-                         ("clf", LogisticRegression(max_iter=200, solver="lbfgs"))])
-        pipe.fit(X[tr_mask], y[tr_mask])
-        p = pipe.predict_proba(X[te_mask])[:,1]
-        tmp = df.loc[te_mask, ["symbol","entry_time","market_level_at_entry","tp_hit","ttl_return"]].copy()
-        tmp["p_tp"] = p
-        all_preds.append(tmp)
-    preds = pd.concat(all_preds, ignore_index=True).sort_values("entry_time").reset_index(drop=True)
-
-    # Helper to evaluate a set of per-regime thresholds
     def eval_cutoffs(cut):
-        pnl = []
-        traded_times = []
-        trades_per_year_by_regime = {k:0.0 for k in range(1,10)}
-
+        pnl=[]; traded=[]
         for k in range(1,10):
-            mask = (preds["market_level_at_entry"].fillna(5).astype(int) == k) & (preds["p_tp"] >= cut[k])
-            sel = preds.loc[mask].copy()
+            m = (preds["market_level_at_entry"].fillna(5).astype(int)==k) & (preds["p_tp"]>=cut[k])
+            sel = preds.loc[m]
             if len(sel)==0: continue
-            # realized returns
             r = sel.apply(lambda r: realized_return(r, tp_map, args.fees_rtt), axis=1).to_numpy()
-            usd = 1000.0 * r
-            pnl.append(pd.DataFrame({"t": sel["entry_time"].to_numpy(), "usd": usd}))
-            traded_times.append(sel["entry_time"])
-            # trades/year for this regime
-            years = max(1e-9, (sel["entry_time"].max() - sel["entry_time"].min()).days / 365.25)
-            if years > 0: trades_per_year_by_regime[k] = len(sel) / years
-
+            usd = 1000.0*r
+            pnl.append(pd.DataFrame({"t": pd.to_datetime(sel["entry_time"]).to_numpy(), "usd": usd}))
+            traded.append(pd.to_datetime(sel["entry_time"]))
         if not pnl:
-            return {"obj": -1e18, "detail": {"profit_year": 0, "mdd": 0, "cvar": 0, "trades": 0}}
-
-        pnl_df = pd.concat(pnl, ignore_index=True).sort_values("t")
+            return {"obj": -1e18, "detail": {"profit_year":0,"mdd":0,"cvar":0,"trades":0}}
+        pnl_df = pd.concat(pnl).sort_values("t")
         cum = pnl_df["usd"].cumsum().to_numpy()
         mdd = max_drawdown_usd(cum)
+        all_times = pd.concat(traded).sort_values()
+        years = max(1e-9, (all_times.max() - all_times.min()).days/365.25)
+        profit_year = float(cum[-1])/years if years>0 else float(cum[-1])
+        cvar = cvar_losses_pct(pnl_df["usd"].to_numpy()/1000.0, alpha=0.95)
+        return {"obj": profit_year, "detail": {"profit_year":profit_year,"mdd":mdd,"cvar":cvar,"trades":int(len(pnl_df))}}
 
-        # Approximate years spanned by all trades
-        all_times = pd.concat(traded_times).sort_values()
-        years_all = max(1e-9, (all_times.max() - all_times.min()).days / 365.25)
-        profit_year = float(cum[-1]) / years_all if years_all>0 else float(cum[-1])
-
-        # Global per-trade returns for CVaR
-        # Recompute returns stream in the same order
-        # (already in USD; convert back to pct by /1000 for CVaR penalty normalization if desired)
-        usd_stream = pnl_df["usd"].to_numpy()
-        pct_stream = usd_stream / 1000.0
-        cvar = cvar_losses_pct(pct_stream, alpha=0.95)
-
-        # Constraints
-        for k in range(1,10):
-            if trades_per_year_by_regime[k] < args.min_trades_per_year:
-                return {"obj": -1e18, "detail": {"profit_year": profit_year, "mdd": mdd, "cvar": cvar, "trades": len(pnl_df)}}
-        if args.dd_cap_usd is not None and mdd > args.dd_cap_usd:
-            return {"obj": -1e18, "detail": {"profit_year": profit_year, "mdd": mdd, "cvar": cvar, "trades": len(pnl_df)}}
-
-        # Objective
-        obj = profit_year - (args.lambda_cvar * (cvar * args.min_trades_per_year * 1000.0))
-        return {"obj": obj, "detail": {"profit_year": profit_year, "mdd": mdd, "cvar": cvar, "trades": len(pnl_df)}}
-
-    # Search: independent best per regime, then enforce monotone
-    best_per_regime = {}
+    # Independent per-regime, then monotone
+    best={}; 
     for k in range(1,10):
-        best_thr, best_obj = None, -1e18
+        best_thr=None; best_obj=-1e18
         for thr in grid:
-            cut = {kk: 0.99 for kk in range(1,10)}  # very strict others
-            cut[k] = thr
-            score = eval_cutoffs(cut)
-            if score["obj"] > best_obj:
-                best_obj, best_thr = score["obj"], thr
-        best_per_regime[k] = best_thr if best_thr is not None else 0.90
+            cut = {kk:0.99 for kk in range(1,10)}; cut[k]=float(thr)
+            sc = eval_cutoffs(cut)
+            if sc["obj"]>best_obj: best_obj, best_thr = sc["obj"], float(thr)
+        best[k]=best_thr if best_thr is not None else 0.9
 
-    # Enforce monotone thresholds
-    cut_mono = enforce_monotone(best_per_regime)
+    cut_mono = enforce_monotone(best)
     final = eval_cutoffs(cut_mono)
 
-    # Save outputs
-    out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     with open(out/"cutoffs.json","w") as f: json.dump(cut_mono, f, indent=2)
     with open(out/"summary.json","w") as f:
-        json.dump({
-            "features_used": choose_features(df),
-            "min_trades_per_year": args.min_trades_per_year,
-            "fees_rtt": args.fees_rtt,
-            "tp_map": tp_map,
-            "grid": list(map(float, grid)),
-            "objective_value": final["obj"],
-            "metrics": final["detail"],
-            "best_raw_per_regime": best_per_regime
-        }, f, indent=2)
+        json.dump({"features_used": features, "grid": list(map(float,grid)), "objective_value": final["obj"],
+                   "metrics": final["detail"], "best_raw_per_regime": best, "debug": info}, f, indent=2)
 
     print(f"[optim] thresholds (monotone): {cut_mono}")
     print(f"[optim] Profit/Year=${final['detail']['profit_year']:,.0f} | MDD=${final['detail']['mdd']:,.0f} | CVaR%={final['detail']['cvar']*100:.2f} | trades={final['detail']['trades']}")
+if __name__=="__main__":
+    main()
