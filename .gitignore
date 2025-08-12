@@ -42,3 +42,6 @@ out/optim/*
 # Local scratch
 scripts/pine/
 tmp_*.py
+
+!out/report/
+!out/report/**
