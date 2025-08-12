@@ -1,5 +1,5 @@
-//@version=6
-indicator("M18 Monotone Thresholds — 2025-08-12", overlay=false, max_lines_count=500, max_labels_count=500)
+﻿//@version=6
+indicator("M18 Monotone Thresholds â€” 2025-08-12", overlay=false, max_lines_count=500, max_labels_count=500)
 
 var float[] CUT = array.from(0.900, 0.900, 0.900, 0.900, 0.300, 0.300, 0.300, 0.300, 0.300)
 
@@ -10,8 +10,8 @@ level_clamped(level) =>
 threshold_for_level(level) =>
     array.get(CUT, level_clamped(level)-1)
 
-// Demo inputs (Tier B will compute p̂ on-chart)
-mkt_level = input.int(5, "Market level (1–9)")
+// Demo inputs (Tier B will compute pÌ‚ on-chart)
+mkt_level = input.int(5, "Market level (1â€“9)")
 p_hat     = input.float(0.50, "Predicted TP prob (from model)", step=0.01)
 
 thr  = threshold_for_level(mkt_level)
@@ -21,7 +21,7 @@ var table T = table.new(position.top_right, 4, 11, border_width=1)
 if barstate.isfirst
     table.cell(T, 0, 0, "Lvl", text_color=color.white)
     table.cell(T, 1, 0, "Cutoff", text_color=color.white)
-    table.cell(T, 2, 0, "Now p̂", text_color=color.white)
+    table.cell(T, 2, 0, "Now pÌ‚", text_color=color.white)
     table.cell(T, 3, 0, "Pass?", text_color=color.white)
     for i=1 to 9
         table.cell(T, 0, i, str.tostring(i))
@@ -33,7 +33,7 @@ if barstate.islast
     for i=1 to 9
         ok = p_hat >= array.get(CUT, i-1)
         table.cell(T, 2, i, i == mkt_level ? str.tostring(p_hat, "#.###") : "")
-        table.cell(T, 3, i, ok ? "✅" : "—", text_color=ok ? color.lime : color.red)
+        table.cell(T, 3, i, ok ? "âœ…" : "â€”", text_color=ok ? color.lime : color.red)
 
-plot(pass ? 1 : 0, "pass(level, p̂)", style=plot.style_columns, color= pass ? color.new(color.green, 0) : color.new(color.red, 70))
-alertcondition(pass, "M18 Pass", "M18: level {mkt_level} pass (p̂={p_hat} ≥ thr={thr})")
+plot(pass ? 1 : 0, "pass(level, pÌ‚)", style=plot.style_columns, color= pass ? color.new(color.green, 0) : color.new(color.red, 70))
+alertcondition(pass, "M18 Pass", "M18: level {mkt_level} pass (pÌ‚={p_hat} â‰¥ thr={thr})")
