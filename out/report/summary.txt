@@ -1,0 +1,9 @@
+M18 Monotone — Optimization Summary
+====================================
+Profit/Year: $1296
+Max Drawdown: $2978
+CVaR 95%: 29.67%
+Trades: 296
+
+Cutoffs (level: threshold):
+1:0.9, 2:0.9, 3:0.9, 4:0.9, 5:0.3, 6:0.3, 7:0.3, 8:0.3, 9:0.3
