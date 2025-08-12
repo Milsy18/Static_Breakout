@@ -156,7 +156,7 @@ def main():
         t0["entry_time"]=pd.to_datetime(t0["entry_time"])
         merged=(t0.merge(labels, on=["symbol","entry_time"], how="inner")
                   .drop_duplicates(subset=["symbol","entry_time"]))
-        merged.to_parquet(args.out_features, index=False)
+        merged = purge_non_t0_offsets(merged)\n        merged = drop_price_like_keep_labels(merged)\n        merged.to_parquet(args.out_features, index=False)
 
     total=len(bo); labeled=len(labels)
     tp_rate=float(labels["tp_hit"].mean()) if labeled else 0.0
@@ -176,4 +176,42 @@ def main():
 if __name__=="__main__":
     main()
 
+
+# === HARD PURGE HELPERS (append into label_success_v2.py) ===
+ALLOWED_LABEL_COLS = {
+  "symbol","entry_time","market_level_at_entry","breakout_id",
+  "tp_hit","ttl_return","mfe","mae","bars_to_tp","exit_reason_label"
+}
+
+def drop_price_like_keep_labels(df: pd.DataFrame) -> pd.DataFrame:
+    keep=[]
+    for c in df.columns:
+        lc=c.lower()
+        if c in ALLOWED_LABEL_COLS:
+            keep.append(c); continue
+        if any(tok in lc for tok in PRICE_LIKE_PATTERNS):
+            continue
+        keep.append(c)
+    return df[keep]
+
+def purge_non_t0_offsets(df: pd.DataFrame) -> pd.DataFrame:
+    import re
+    keep=[]
+    for c in df.columns:
+        if c in ALLOWED_LABEL_COLS:
+            keep.append(c); continue
+        lc=c.lower()
+        m=re.search(r'@t(-?\d+)|_t(\d+)|t\+(\d+)', lc)
+        if not m:
+            keep.append(c); continue
+        # extract the first matched integer
+        g = next((g for g in m.groups() if g is not None), None)
+        try:
+            n=int(g)
+        except:
+            n=None
+        if n==0:
+            keep.append(c)  # explicit t0
+        # else: drop
+    return df[keep]
 
