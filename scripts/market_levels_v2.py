@@ -15,7 +15,7 @@ def load_series(root: Path, name: str) -> pd.DataFrame:
     df = pd.read_csv(cand[0])
     cols = {c.lower(): c for c in df.columns}
     if "date" not in cols: raise KeyError(f"{name}: need a 'date' column")
-    df["date"] = pd.to_datetime(df[cols["date"]], errors="coerce")
+    df["date"] = pd.to_datetime(df[cols["date"]], utc=True, errors="coerce")
     # prefer 'close' then 'value'
     valcol = "close" if "close" in cols else ("value" if "value" in cols else None)
     if not valcol: 
@@ -93,7 +93,7 @@ def main():
     if args.labels:
         try:
             labels = pd.read_parquet(args.labels)
-            labels["entry_time"] = pd.to_datetime(labels["entry_time"])
+            labels["entry_time"] = pd.to_datetime(labels["entry_time"], utc=True)
             # align label rows to daily date
             L = labels[["symbol","entry_time","tp_hit"]].copy()
             L["date"] = L["entry_time"].dt.floor("D")
@@ -129,6 +129,9 @@ def main():
 
     # map to breakouts
     bo = pd.read_csv(args.breakouts)
+    # drop any stale levels column to avoid duplicates
+    if "market_level_at_entry" in bo.columns:
+        bo = bo.drop(columns=["market_level_at_entry"])
     if "symbol" not in bo.columns: 
         raise KeyError("breakouts file needs 'symbol'")
     # find a time column
@@ -137,7 +140,7 @@ def main():
         if c in bo.columns: tcol=c; break
     if tcol is None: raise KeyError("breakouts file needs an entry time column (e.g., entry_time)")
 
-    bo[tcol] = pd.to_datetime(bo[tcol])
+    bo[tcol] = pd.to_datetime(bo[tcol], utc=True)
     bo["date"] = bo[tcol].dt.floor("D")
     out = (bo.merge(m[["date","level"]], on="date", how="left")
              .rename(columns={"level":"market_level_at_entry"}))
@@ -151,9 +154,8 @@ def main():
 
     # optional: write breakouts with levels for re-labeling
     if args.breakouts_out:
-        out_bo = bo.copy()
-        out_bo = out_bo.merge(outp, on=["symbol","date"], how="left")
-        out_bo["market_level_at_entry"] = out_bo["market_level_at_entry"].fillna(5).astype(int)
+        # reuse `out` which already contains symbol, date, original time col, and the new level
+        out_bo = out.copy()
         out_bo.drop(columns=["date"], inplace=True, errors="ignore")
         Path(args.breakouts_out).parent.mkdir(parents=True, exist_ok=True)
         out_bo.to_csv(args.breakouts_out, index=False)
@@ -162,3 +164,5 @@ def main():
     print(f"[mkt] wrote per-row parquet: {args.out} (rows={len(outp)})")
     if args.breakouts_out:
         print(f"[mkt] wrote breakouts+levels: {args.breakouts_out}")
+if __name__ == "__main__":
+    main()
