@@ -1,0 +1,23 @@
+// @version=5
+indicator("M18 Entry (auto-generated)", overlay=true)
+
+// ==== Auto-generated parameters (from optimiser) ====
+w_trd = input.float(defval=0.378199, title="Weight TRD", minval=0, maxval=1)
+w_vty = input.float(defval=0.304889, title="Weight VTY", minval=0, maxval=1)
+w_vol = input.float(defval=0.275311, title="Weight VOL", minval=0, maxval=1)
+w_mom = input.float(defval=0.041601, title="Weight MOM", minval=0, maxval=1)
+
+min_total = input.float(defval=9.638832, title="Min total score", step=0.01)
+min_mod   = input.float(defval=0.850229,   title="Min per-module score", step=0.01)
+
+// TODO: replace these with your live module score series
+score_trd = input.float(title="score_trd (wire real series)")
+score_vty = input.float(title="score_vty (wire real series)")
+score_vol = input.float(title="score_vol (wire real series)")
+score_mom = input.float(title="score_mom (wire real series)")
+
+score_comp = w_trd*score_trd + w_vty*score_vty + w_vol*score_vol + w_mom*score_mom
+
+enter_long = (score_comp >= min_total) and (score_trd >= min_mod) and (score_vty >= min_mod) and (score_vol >= min_mod) and (score_mom >= min_mod)
+
+plotshape(enter_long, title="Enter long", style=shape.triangleup, location=location.belowbar)

@@ -1,44 +1,19 @@
-# data artifacts (keep placeholders)
-Data/**/*.csv
-Data/**/*.parquet
-Data/**/*.feather
-!Data/**/.gitkeep
-
-# notebooks + caches
-.ipynb_checkpoints/
-*.ipynb.zip
-
-# python junk
+﻿# --- virtual env / editor junk ---
+.venv/
 __pycache__/
 *.pyc
-.pytest_cache/
-.coverage
+.vscode/
+*.log
 
-# envs
-.env
-venv/
-.venv/
-
-# OS/editor
+# --- OS files ---
 .DS_Store
 Thumbs.db
 
-# allow processed parquet outputs
-!Data/Processed/**/*.parquet
-
+# --- BIG DATA (kept outside git) ---
+# Data\Processed is a junction to your m18-model2 data folder; ignore everything under it
+Data/Processed/
+# Any ad-hoc charts/exports
 out/
 
-repo_snapshot.zip
-
-# publish breakout payload
-!Data/Processed/static_breakouts.csv
-# Local scratch / big outputs
-repo_snapshot.zip
-Data/Processed/expectancy/
-Data/Processed/baseline_stats/
-Data/Processed/yearly_pnl/
-out/optim/*
-!out/optim/latest/
-# Local scratch
-scripts/pine/
-tmp_*.py
+# Optional: keep raw images if you ever add docs/images
+# (We do NOT blanket-ignore *.png so you can commit docs images later.)

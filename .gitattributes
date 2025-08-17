@@ -1,2 +1,5 @@
-*.parquet filter=lfs diff=lfs merge=lfs -text
-*.parquet filter=lfs diff=lfs merge=lfs -text
+﻿* text=auto
+*.sh  eol=lf
+*.py  eol=lf
+*.ps1 eol=crlf
+*.bat eol=crlf
