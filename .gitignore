@@ -1,19 +1,29 @@
-﻿# --- virtual env / editor junk ---
+﻿# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
 .venv/
 __pycache__/
 *.pyc
-.vscode/
-*.log
+.env
 
-# --- OS files ---
-.DS_Store
-Thumbs.db
+# Jupyter
+.ipynb_checkpoints/
 
-# --- BIG DATA (kept outside git) ---
-# Data\Processed is a junction to your m18-model2 data folder; ignore everything under it
-Data/Processed/
-# Any ad-hoc charts/exports
-out/
+# DATA — keep big files out of Git
+Data/
+Data/**
 
-# Optional: keep raw images if you ever add docs/images
-# (We do NOT blanket-ignore *.png so you can commit docs images later.)
+# Outputs (allow only small curated artifacts)
+out/**/*.parquet
+out/**/*_raw.*
+out/**/_tmp/**
+!out/**/*.png
+!out/**/*.csv
+!out/pine_defaults_preview.txt
+
+# Allow small sample data
+!sample_data/**
