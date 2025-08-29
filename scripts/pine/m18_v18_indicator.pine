@@ -1,0 +1,319 @@
+//@version=6
+indicator("M18 Entry/Exit Model v18.2 (K-only)", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ------------------------------------------------------------------------------
+// Inputs
+// ------------------------------------------------------------------------------
+kDefault   = 5
+showTrail  = input.bool(true,  "Show continuation trail line")
+showDots   = input.bool(true,  "Show NEAR/ENTRY/EXIT dots (K-only)")
+showLegacy = input.bool(true,  "Show legacy v7.1 entry/exit (visual-only, dots above bar)")
+
+// NEAR (gate) slack (e.g., 0.90 means “within 90% of threshold” band, but not already passing)
+nearPct    = input.float(0.90, "NEAR slack vs. gate thresholds", minval=0.50, maxval=1.00, step=0.01)
+
+// Market Level (rc3 module)
+ml_tf   = input.timeframe("D", "Market Level timeframe (LOCKED)")
+ml_len  = input.int(14, "ML lookback", minval=5)
+ml_sm   = input.int(1,  "ML smoothing bars", minval=1, maxval=5)
+ml_min  = input.int(5,  "Legacy v7.1 min ML for near_also (visual)", minval=1, maxval=9)
+
+// Entry/Exit/Continuation controls
+kForEntry     = input.int(kDefault, "K-of-N for ENTRY (K-only)",       minval=1, maxval=8)
+allowGateCont = input.bool(true,    "Allow continuation if K gates still on")
+kForCont      = input.int(kDefault, "K-of-N for continuation",         minval=1, maxval=8)
+
+// Core feature lengths
+rsilen=14, adxlen=14, cmflen=20, bblen=20, bbMult=2.0, emaFast=10, emaMid=50, emaSlow=200, rvollen=20, atrLen=14
+
+// ------------------------------------------------------------------------------
+// Helpers (shared style)
+// ------------------------------------------------------------------------------
+tanh_(x)=> x>9?1.0:x<-9?-1.0:(math.exp(2.0*x)-1.0)/(math.exp(2.0*x)+1.0)
+cmf_calc(len)=>
+    rng = high - low
+    mfm = rng==0.0 ? 0.0 : ((close-low) - (high-close)) / rng
+    mfv = mfm * volume
+    num = ta.sma(mfv, len)
+    den = ta.sma(volume, len)
+    den==0.0 ? 0.0 : num/den
+safeMedian(x,longLen,shortLen)=> nz(ta.median(x,longLen), nz(ta.median(x,shortLen), x))
+
+// NEAR bands (strict "close but not yet")
+// Use near_ge for gates of the form val >= thr, and near_le for val <= thr.
+near_ge(val, thr, p)=> not na(val) and not na(thr) and (val <  thr) and (val >= (thr - (1.0 - p) * math.abs(thr)))
+near_le(val, thr, p)=> not na(val) and not na(thr) and (val >  thr) and (val <= (thr + (1.0 - p) * math.abs(thr)))
+
+// ------------------------------------------------------------------------------
+// Market Level Module v6.10 (continuous 1..9; lock to Daily; smoothing)
+// ------------------------------------------------------------------------------
+pos_(x,len)=> rng=ta.highest(x,len)-ta.lowest(x,len), rng==0?0.5:(x-ta.lowest(x,len))/rng
+ml_v610(tf,len,sm)=>
+    btcD   = request.security("CRYPTOCAP:BTC.D",  tf, close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+    usdtD  = request.security("CRYPTOCAP:USDT.D", tf, close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+    total3 = request.security("CRYPTOCAP:TOTAL3", tf, close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+    total  = request.security("CRYPTOCAP:TOTAL",  tf, close, lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+    p_total3 = pos_(total3, len)
+    p_total  = pos_(total,  len)
+    p_usdtD  = 1.0 - pos_(usdtD, len)
+    p_btcD   = 1.0 - pos_(btcD,  len)
+    raw  = 0.35*p_total3 + 0.35*p_total + 0.15*p_usdtD + 0.15*p_btcD
+    ml01 = ta.sma(raw, sm)
+    mlc  = 1.0 + 8.0 * ml01
+    mlb  = int(math.round(mlc))
+    [mlc, mlb]
+
+[ml_cont, ml_bucket] = ml_v610(ml_tf, ml_len, ml_sm)
+
+// ------------------------------------------------------------------------------
+// Core features
+// ------------------------------------------------------------------------------
+rsi  = ta.rsi(close, rsilen)
+[_diP,_diM,adxRaw] = ta.dmi(adxlen, adxlen)
+adx  = nz(adxRaw, 0.0)
+cmf  = cmf_calc(cmflen)
+volSma = ta.sma(volume, rvollen)
+rv   = na(volume) or na(volSma) or volSma==0.0 ? na : (volume/volSma)
+
+e10 = ta.ema(close, emaFast)
+e50 = ta.ema(close, emaMid)
+e200= ta.ema(close, emaSlow)
+e1050  = e50==0.0 ? na : e10/e50
+e50200 = e200==0.0 ? na : e50/e200
+
+bbBasis = ta.sma(close, bblen)
+bbDev   = ta.stdev(close, bblen) * bbMult
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbw_pct = (bbUpper - bbLower) / math.max(close, 1e-9)
+range_like = (high - low) / math.max(close, 1e-9)
+atr = ta.atr(atrLen)
+
+// Readiness
+bbwMed  = safeMedian(bbw_pct*100.0, 200, 50)
+rngPct  = range_like*100.0
+rngMed  = safeMedian(rngPct,       200, 50)
+rsiz    = (nz(rsi,50.0)-50.0)/10.0
+adxz    = (adx-20.0)/10.0
+cmfz    = cmf*5.0
+rvolz   = (rv-1.0)*1.5
+e1050z  = na(e1050)?na:e1050-1.0
+e50200z = na(e50200)?na:e50200-1.0
+bbwZ    = ( (bbw_pct*100.0) - bbwMed ) / math.max(1e-9, bbwMed)
+rngZ    = ( rngPct          - rngMed ) / math.max(1e-9, rngMed)
+scoreRaw = tanh_(nz(rsiz,0))*1.2 + tanh_(nz(adxz,0))*1.2 + tanh_(nz(cmfz,0))*0.8 + tanh_(nz(rvolz,0))*0.8 + tanh_(nz(e1050z,0))*0.6 + tanh_(nz(e50200z,0))*0.6 + tanh_(nz(bbwZ,0))*0.6 + tanh_(nz(rngZ,0))*0.6
+wSum    = 1.2+1.2+0.8+0.8+0.6+0.6+0.6+0.6
+score01 = math.max(math.min(0.5 + 0.5*(scoreRaw/math.max(wSum,1e-9)), 1.0), 0.0)
+readiness = score01
+
+// Per-ML thresholds
+var float[] thr_rsi     = array.from(50.0,60.0,45.0,45.0,50.0,60.0,60.0,55.0,60.0)
+var float[] thr_adx     = array.from(22.0,15.0,18.0,15.0,25.0,15.0,15.0,18.0,30.0)
+var float[] thr_cmf     = array.from(-0.02,-0.02,-0.02,-0.02,-0.02,-0.02,0.00,-0.02,-0.02)
+var float[] thr_rvol    = array.from(0.90,0.90,0.90,0.90,0.90,0.90,0.90,1.00,0.90)
+var float[] thr_e1050   = array.from(1.01,0.99,0.99,0.99,0.99,0.99,0.99,0.99,0.99)
+var float[] thr_e50200  = array.from(0.98,0.98,0.98,0.98,0.98,0.98,0.98,0.98,0.98)
+var float[] thr_bbw     = array.from(1.130303,0.643155,0.559212,0.401387,0.407778,0.411255,0.413464,0.432329,0.345209)
+var float[] thr_rngLike = array.from(0.236101,0.131116,0.114766,0.109230,0.082328,0.093517,0.078215,0.108460,0.096552)
+
+mlIdx = int(math.max(0, math.min(8, ml_bucket-1)))
+
+g_rsi_thr    = array.get(thr_rsi,    mlIdx)
+g_adx_thr    = array.get(thr_adx,    mlIdx)
+g_cmf_thr    = array.get(thr_cmf,    mlIdx)
+g_rvol_thr   = array.get(thr_rvol,   mlIdx)
+g_e1050_thr  = array.get(thr_e1050,  mlIdx)
+g_e50200_thr = array.get(thr_e50200, mlIdx)
+g_bbw_thr    = array.get(thr_bbw,    mlIdx)
+g_rng_thr    = array.get(thr_rngLike,mlIdx)
+
+g_rsi    = not na(rsi)     and rsi    >= g_rsi_thr
+g_adx    = not na(adx)     and adx    >= g_adx_thr
+g_cmf    = not na(cmf)     and cmf    >= g_cmf_thr
+g_rvol   = not na(rv)      and rv     >= g_rvol_thr
+g_e1050  = not na(e1050)   and e1050  >= g_e1050_thr
+g_e50200 = not na(e50200)  and e50200 >= g_e50200_thr
+g_bbw    = not na(bbw_pct) and bbw_pct<= g_bbw_thr
+g_rng    = not na(range_like) and range_like<=g_rng_thr
+
+sum_on = (g_rsi?1:0)+(g_adx?1:0)+(g_cmf?1:0)+(g_rvol?1:0)+(g_e1050?1:0)+(g_e50200?1:0)+(g_bbw?1:0)+(g_rng?1:0)
+
+// ------------------------------------------------------------------------------
+// NEAR dots (strict “close but not yet” band, never when gate already passes)
+// ------------------------------------------------------------------------------
+near_rsi    = near_ge(rsi,        g_rsi_thr,    nearPct)
+near_adx    = near_ge(adx,        g_adx_thr,    nearPct)
+near_cmf    = near_ge(cmf,        g_cmf_thr,    nearPct)
+near_rvol   = near_ge(rv,         g_rvol_thr,   nearPct)
+near_e1050  = near_ge(e1050,      g_e1050_thr,  nearPct)
+near_e50200 = near_ge(e50200,     g_e50200_thr, nearPct)
+near_bbw    = near_le(bbw_pct,    g_bbw_thr,    nearPct)
+near_rng    = near_le(range_like, g_rng_thr,    nearPct)
+
+near_gate = (near_rsi or near_adx or near_cmf or near_rvol or near_e1050 or near_e50200 or near_bbw or near_rng)
+near_gate_src = near_rsi?"rsi":near_adx?"adx":near_cmf?"cmf":near_rvol?"rvol":near_e1050?"e1050":near_e50200?"e50200":near_bbw?"bbw":"rng"
+
+// Legacy v7.1 proxy for “nearalso” (visual only – never triggers K-only entry)
+brkLen = 20
+isBreakout = close > ta.highest(high, brkLen)[1]
+ema5      = ta.ema(close, 5)
+ema5_prev = ema5[1]
+ema5_up   = ema5 > ema5_prev
+near_also = isBreakout and ema5_up and (sum_on>=kDefault) and (ml_bucket>=ml_min)
+
+// ------------------------------------------------------------------------------
+// ENTRY (K-of-8 only; slingshot removed)
+// ------------------------------------------------------------------------------
+entryNow = sum_on >= kForEntry
+
+// ------------------------------------------------------------------------------
+// EXIT and continuation (per-ML arrays)
+// ------------------------------------------------------------------------------
+var int[]   timeN     = array.from(3,3,10,5,3,3,3,5,3)
+var int[]   extDays   = array.from(2,2,0,2,2,2,2,2,2)
+var float[] extATRmul = array.from(1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0)
+var float[] extRSImin = array.from(60.0,60.0,60.0,60.0,60.0,60.0,60.0,60.0,60.0)
+var float[] extTrail  = array.from(1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0)
+
+exDays   = array.get(timeN,     mlIdx)
+exExt    = array.get(extDays,   mlIdx)
+exATRm   = array.get(extATRmul, mlIdx)
+exRSI    = array.get(extRSImin, mlIdx)
+exTrailA = array.get(extTrail,  mlIdx)
+
+trailStop(_anchor,_atrMult)=> _anchor - (_atrMult * atr)
+
+// ------------------------------------------------------------------------------
+// K-only Trade state machine
+// ------------------------------------------------------------------------------
+var bool  inTrade     = false
+var float entryPrice  = na
+var int   barsInTrade = 0
+var float hiSinceEnt  = na
+
+entrySignal = false
+exitSignal  = false
+var float trailSeries = na
+
+if not inTrade
+    if entryNow
+        inTrade     := true
+        entrySignal := true
+        entryPrice  := close
+        barsInTrade := 0
+        hiSinceEnt  := high
+        trailSeries := na
+else
+    barsInTrade += 1
+    hiSinceEnt  := na(hiSinceEnt) ? high : math.max(hiSinceEnt, high)
+    hitTime     = barsInTrade >= exDays
+    canExtend   = exExt>0 and barsInTrade < (exDays+exExt)
+    contOK_val  = (na(atr) or na(ema5_prev)) ? false : ((atr/atr[1]) >= exATRm and (na(rsi)?false:rsi>=exRSI))
+    gateOK_val  = allowGateCont and (sum_on>=kForCont)
+    extendOK    = contOK_val or gateOK_val
+    trailSeries := na
+    if hitTime
+        if canExtend and extendOK
+            st = trailStop(hiSinceEnt, exTrailA)
+            trailSeries := showTrail ? st : na
+            if close < st
+                exitSignal := true
+                inTrade    := false
+                trailSeries:= na
+        else
+            exitSignal := true
+            inTrade    := false
+            trailSeries:= na
+
+// ------------------------------------------------------------------------------
+// Legacy v7.1 overlay (visuals-only): tiny green/red dots ABOVE bars
+// Uses near_also as legacy-entry proxy, and same exit scaffold as K-only.
+// ------------------------------------------------------------------------------
+var bool  inTrade_L      = false
+var int   barsInTrade_L  = 0
+var float hiSinceEnt_L   = na
+legacyEntrySig = false
+legacyExitSig  = false
+
+if showLegacy
+    if not inTrade_L
+        if near_also
+            inTrade_L      := true
+            legacyEntrySig := true
+            barsInTrade_L  := 0
+            hiSinceEnt_L   := high
+    else
+        barsInTrade_L += 1
+        hiSinceEnt_L   := na(hiSinceEnt_L) ? high : math.max(hiSinceEnt_L, high)
+        hitTimeL     = barsInTrade_L >= exDays
+        canExtendL   = exExt > 0 and barsInTrade_L < (exDays + exExt)
+        contOK_L     = (na(atr) or na(ema5_prev)) ? false : ((atr/atr[1]) >= exATRm and (na(rsi) ? false : rsi >= exRSI))
+        gateOK_L     = allowGateCont and (sum_on >= kForCont)
+        extendOK_L   = contOK_L or gateOK_L
+        if hitTimeL
+            if canExtendL and extendOK_L
+                stL = hiSinceEnt_L - (exTrailA * atr)
+                if close < stL
+                    legacyExitSig := true
+                    inTrade_L     := false
+                    hiSinceEnt_L  := na
+            else
+                legacyExitSig := true
+                inTrade_L     := false
+                hiSinceEnt_L  := na
+
+// ------------------------------------------------------------------------------
+// Plots (all dots tiny; K-only below bar, legacy above bar)
+// ------------------------------------------------------------------------------
+plot(trailSeries, title="Continuation Trail", color=color.new(color.aqua, 0), linewidth=2, style=plot.style_linebr)
+
+plotshape(showDots and near_gate  and not inTrade, title="NEAR (gate)",  style=shape.circle, size=size.tiny, color=color.yellow, location=location.belowbar, text="")
+plotshape(showDots and near_also  and not inTrade, title="NEAR (also)",  style=shape.circle, size=size.tiny, color=color.blue,   location=location.belowbar, text="")
+
+// K-only signals (below bar)
+plotshape(showDots and entrySignal, title="ENTRY (K-only)", style=shape.circle, size=size.tiny, color=color.lime, location=location.belowbar, text="")
+plotshape(showDots and exitSignal,  title="EXIT  (K-only)", style=shape.circle, size=size.tiny, color=color.red,  location=location.belowbar, text="")
+
+// Legacy overlay (above bar)
+plotshape(showLegacy and legacyEntrySig, title="LEGACY ENTRY", style=shape.circle, size=size.tiny, color=color.lime, location=location.abovebar, text="")
+plotshape(showLegacy and legacyExitSig,  title="LEGACY EXIT",  style=shape.circle, size=size.tiny, color=color.red,  location=location.abovebar, text="")
+
+// Context MAs
+plot(e10,  "EMA10",  color=color.new(color.teal,  0))
+plot(e50,  "EMA50",  color=color.new(color.orange,0))
+plot(e200, "EMA200", color=color.new(color.gray,  0))
+
+// ------------------------------------------------------------------------------
+// Bottom-right 2-column table
+// ------------------------------------------------------------------------------
+add_row(_t, _r, _label, _value) =>
+    bg1 = color.new(color.gray, 10)
+    bg2 = color.new(color.gray,  0)
+    table.cell(_t, 0, _r, _label, bgcolor=bg1, text_color=color.black)
+    table.cell(_t, 1, _r, _value, bgcolor=bg2, text_color=color.black)
+    _r + 1
+
+var table t = table.new(position.bottom_right, 2, 20, border_width=1)
+if barstate.islast
+    table.clear(t, start_row=0, start_column=0, end_row=19, end_column=1)
+    table.cell(t, 0, 0, "Metric", bgcolor=color.new(color.gray,12), text_color=color.black)
+    table.cell(t, 1, 0, "Value",  bgcolor=color.new(color.gray, 0), text_color=color.black)
+    r = 1
+    r := add_row(t, r, "ML (cont)",  str.tostring(ml_cont, format.mintick))
+    r := add_row(t, r, "ML (bucket)", str.tostring(ml_bucket))
+    r := add_row(t, r, "k/8",         str.tostring(sum_on)+"/8")
+    r := add_row(t, r, "Readiness",   str.tostring(int(math.round(readiness*100.0))))
+    r := add_row(t, r, "NEAR gate",   near_gate  ? ("yes:"+near_gate_src) : "no")
+    r := add_row(t, r, "NEAR also",   near_also  ? "yes" : "no")
+    r := add_row(t, r, "Exit N",      str.tostring(exDays))
+    r := add_row(t, r, "Exit days",   str.tostring(exExt))
+    r := add_row(t, r, "Exit RSI=",   str.tostring(exRSI, format.mintick))
+    r := add_row(t, r, "Trail ATR×",  str.tostring(exTrailA, format.mintick))
+
+// ------------------------------------------------------------------------------
+// Alerts
+// ------------------------------------------------------------------------------
+alertcondition(entrySignal,               title="M18 ENTRY (K-only)", message="M18 ENTRY (K-only) — {{ticker}}")
+alertcondition(exitSignal,                title="M18 EXIT  (K-only)", message="M18 EXIT  (K-only) — {{ticker}}")
+alertcondition(near_gate and not inTrade, title="M18 NEAR (gate)",    message="M18 NEAR (gate) — {{ticker}}")
+alertcondition(near_also and not inTrade, title="M18 NEAR (also)",    message="M18 NEAR (also) — {{ticker}}")

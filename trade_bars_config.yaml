@@ -1,0 +1,12 @@
+﻿paths:
+  trades_csv: ./trades_clean_for_exit_tests.csv
+  ohlcv_folder: ./Data/Filtered_OHLCV
+  ohlcv_parquet: ""
+  out_csv: ./trade_bars.csv
+timeframe:
+  type: D
+  timeframe_minutes: null
+indicators:
+  atr_window: 14
+  donchian_window: 20
+  bb_window: 20
