@@ -1,0 +1,12 @@
+﻿{
+  "name": "ATR Trail 1.25x (no cap)",
+  "family": "atr_trail",
+  "multiplier": 1.25,
+  "cap_bars": null,
+  "inputs": ["close","atr"],
+  "atr": { "window": 14, "method": "rolling_mean_true_range" },
+  "timeframe": { "type": "D", "minutes": null },
+  "source": "exit_harness",
+  "artifact": "exits_atr_1p25_nocap.csv",
+  "version": "v1"
+}
