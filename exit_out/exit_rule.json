@@ -1,12 +1,21 @@
-﻿{
-  "name": "ATR Trail 1.25x (no cap)",
+{
+  "name": "ATR Trail 1.25x OR 6 bars",
   "family": "atr_trail",
   "multiplier": 1.25,
-  "cap_bars": null,
-  "inputs": ["close","atr"],
-  "atr": { "window": 14, "method": "rolling_mean_true_range" },
-  "timeframe": { "type": "D", "minutes": null },
+  "cap_bars": 6,
+  "inputs": [
+    "close",
+    "atr"
+  ],
+  "atr": {
+    "window": 14,
+    "method": "rolling_mean_true_range"
+  },
+  "timeframe": {
+    "type": "D",
+    "minutes": null
+  },
   "source": "exit_harness",
-  "artifact": "exits_atr_1p25_nocap.csv",
+  "artifact": "exits_hybrid_atr1p25_cap6.csv",
   "version": "v1"
 }
