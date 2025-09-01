@@ -1,7 +1,8 @@
 ﻿paths:
-  trades_csv: ./trades_clean_for_exit_tests.csv
+  trades_csv: ./trades_clean_exit_compat.csv
   trade_bars_csv: ./trade_bars.csv
   out_dir: ./exit_out
+
 params:
-  time_caps: [6, 8, 10, 12, 15, 20]   # keep for reference, won’t be top when ATR is pinned
+  time_caps: [6, 8, 10, 12, 15, 20]
   atr_multipliers: [1.25]

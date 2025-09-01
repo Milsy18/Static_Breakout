@@ -1,29 +1,16 @@
-﻿# OS/editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
-
 # Python
-.venv/
 __pycache__/
 *.pyc
+.venv/
+
+# Outputs & artifacts
+out/
+exit_out/
+reports/
+trade_bars.csv
+trades_clean*.csv
+*.csv
+
+# Local-only stuff
 .env
-
-# Jupyter
-.ipynb_checkpoints/
-
-# DATA — keep big files out of Git
-Data/
-Data/**
-
-# Outputs (allow only small curated artifacts)
-out/**/*.parquet
-out/**/*_raw.*
-out/**/_tmp/**
-!out/**/*.png
-!out/**/*.csv
-!out/pine_defaults_preview.txt
-
-# Allow small sample data
-!sample_data/**
+*.log

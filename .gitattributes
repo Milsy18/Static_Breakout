@@ -1,5 +1,16 @@
-﻿* text=auto
-*.sh  eol=lf
-*.py  eol=lf
-*.ps1 eol=crlf
-*.bat eol=crlf
+# Default: normalize text files to LF in repo
+* text=auto eol=lf
+
+# Keep Windows scripts CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Force LF for code & data
+*.py   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+*.csv  text eol=lf
