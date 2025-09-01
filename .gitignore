@@ -22,3 +22,5 @@ Data/Processed/*.gz
 Data/Processed/*.zip
 bars_build_manifest.json
 Data/Processed/**
+!data/sample/*.csv
+!out/model_summary.csv
