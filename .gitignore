@@ -21,3 +21,4 @@ Data/Processed/*.json
 Data/Processed/*.gz
 Data/Processed/*.zip
 bars_build_manifest.json
+Data/Processed/**
