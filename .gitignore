@@ -14,3 +14,10 @@ trades_clean*.csv
 # Local-only stuff
 .env
 *.log
+Archive_*/
+*.parquet
+Data/Processed/*.csv
+Data/Processed/*.json
+Data/Processed/*.gz
+Data/Processed/*.zip
+bars_build_manifest.json
